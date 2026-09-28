@@ -52,10 +52,27 @@ class Params:
     fee_pct: float = 0.015
     tax_pct: float = 0.20
     slippage_bps: float = 0.0
+    # Where an entry fills. "next_open" buys at the next session's open.
+    # "signal_close" buys at the close the signal is read on — the closing
+    # call auction the live watcher can submit into — and pays no entry
+    # slippage, because every order in the auction fills at one price.
+    # Exits keep `slippage_bps` either way.
+    entry_fill: str = "next_open"
+    # Enter only when the stock's return over the last `PEER_LOOKBACK`
+    # sessions, minus the mean of every symbol in the run over the same
+    # sessions, is at least this many percentage points. None = off. A dip
+    # the stock took alone is dropped; a dip shared with the market is kept.
+    min_peer_excess_5d_pct: float | None = None
 
     def __post_init__(self) -> None:
         if self.entry_mode not in {"momentum", "below_ma", "drop_from_high"}:
             raise ValueError("unsupported entry_mode")
+        if self.entry_fill not in {"next_open", "signal_close"}:
+            raise ValueError("entry_fill must be next_open or signal_close")
+        if self.min_peer_excess_5d_pct is not None and not isfinite(
+            self.min_peer_excess_5d_pct
+        ):
+            raise ValueError("min_peer_excess_5d_pct must be finite")
         if self.ma_entry_style not in {"band", "crossover"}:
             raise ValueError("ma_entry_style must be band or crossover")
         if min(self.ma_period, self.high_lookback, self.max_hold_days) < 1:
@@ -212,15 +229,19 @@ def simulate_exits(
     i = 1
     n = len(rows)
     while i < n - 1:
-        if entry_start_date is not None and rows[i + 1]["d"] < entry_start_date:
+        fill_at_close = p.entry_fill == "signal_close"
+        fill_day = rows[i]["d"] if fill_at_close else rows[i + 1]["d"]
+        if entry_start_date is not None and fill_day < entry_start_date:
             i += 1
             continue
         if not entry_fn(rows, i):
             i += 1
             continue
-        # entry at next day's open
-        entry = rows[i + 1]["o"] * (1 + slippage)
-        entry_date = rows[i + 1]["d"]
+        if fill_at_close:
+            entry = rows[i]["c"]  # closing auction: one price, no spread
+        else:
+            entry = rows[i + 1]["o"] * (1 + slippage)
+        entry_date = fill_day
         stop_px = entry * (1 + p.stop_loss_pct / 100)
         take_px = entry * (1 + p.take_profit_pct / 100)
         exit_px = exit_date = reason = None
@@ -252,20 +273,74 @@ def simulate_exits(
     return trades
 
 
+PEER_LOOKBACK = 5
+_MIN_PEERS = 10
+
+
+def peer_mean_returns(
+    series: dict[str, list[dict]], lookback: int = PEER_LOOKBACK
+) -> dict[str, float]:
+    """Mean `lookback`-session return (%) across the run's symbols, per date.
+
+    Dates on the shared calendar where fewer than `_MIN_PEERS` symbols have
+    both prices are left out: a mean of a handful says little.
+    """
+
+    closes = {
+        code: {row["d"]: row["c"] for row in normalize_rows(bars)}
+        for code, bars in series.items()
+    }
+    dates = sorted({d for by_day in closes.values() for d in by_day})
+    out: dict[str, float] = {}
+    for t in range(lookback, len(dates)):
+        start, day = dates[t - lookback], dates[t]
+        values = [
+            (by_day[day] / by_day[start] - 1) * 100
+            for by_day in closes.values()
+            if day in by_day and start in by_day
+        ]
+        if len(values) >= _MIN_PEERS:
+            out[day] = sum(values) / len(values)
+    return out
+
+
+def _peer_excess_allows(
+    rows: list[dict], i: int, p: Params, peers: dict[str, float] | None
+) -> bool:
+    """The peer filter. Where the excess can't be measured, it does not filter."""
+
+    if p.min_peer_excess_5d_pct is None or peers is None or i < PEER_LOOKBACK:
+        return True
+    mean = peers.get(rows[i]["d"])
+    if mean is None:
+        return True
+    own = (rows[i]["c"] / rows[i - PEER_LOOKBACK]["c"] - 1) * 100
+    return own - mean >= p.min_peer_excess_5d_pct
+
+
 def backtest_symbol(
-    code: str, bars: list[dict], p: Params, *, entry_start_date: str | None = None
+    code: str,
+    bars: list[dict],
+    p: Params,
+    *,
+    entry_start_date: str | None = None,
+    peer_returns: dict[str, float] | None = None,
 ) -> list[Trade]:
     """Run the entry/exit rules over one symbol's daily bars.
 
     ``bars`` must be chronological (oldest first), each with
     open_pric/high_pric/low_pric and close (cur_prc). Overlapping positions
     are not opened — once in a trade, new entries wait until it closes.
+    ``peer_returns`` feeds the peer filter; `run_backtest` computes it.
     """
     rows = normalize_rows(bars)
-    return simulate_exits(
-        code, rows, p, lambda rows, index: _entry_signal(rows, index, p),
-        entry_start_date=entry_start_date,
-    )
+
+    def entry(rows: list[dict], index: int) -> bool:
+        return _entry_signal(rows, index, p) and _peer_excess_allows(
+            rows, index, p, peer_returns
+        )
+
+    return simulate_exits(code, rows, p, entry, entry_start_date=entry_start_date)
 
 
 def run_backtest(
@@ -273,7 +348,12 @@ def run_backtest(
 ) -> Result:
     """Backtest a universe: {code: [bars]} → aggregated Result."""
     res = Result()
+    peers = peer_mean_returns(series) if p.min_peer_excess_5d_pct is not None else None
     for code, bars in series.items():
-        res.trades.extend(backtest_symbol(code, bars, p, entry_start_date=entry_start_date))
+        res.trades.extend(
+            backtest_symbol(
+                code, bars, p, entry_start_date=entry_start_date, peer_returns=peers
+            )
+        )
     res.trades.sort(key=lambda t: t.entry_date)
     return res

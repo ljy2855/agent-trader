@@ -28,6 +28,7 @@ import argparse
 import asyncio
 import json
 import sys
+from dataclasses import replace
 from typing import Any
 
 from .engine import Params, run_backtest
@@ -86,6 +87,8 @@ def _run(args) -> None:
         fee_pct=args.fee_pct,
         tax_pct=args.tax_pct,
         slippage_bps=args.slippage_bps,
+        entry_fill=args.entry_fill,
+        min_peer_excess_5d_pct=args.min_peer_excess_5d,
     )
     res = run_backtest(series, p)
     s = res.summary()
@@ -93,12 +96,13 @@ def _run(args) -> None:
           f"진입 {p.entry_mode}/{p.ma_entry_style}, "
           f"손절 {p.stop_loss_pct}% / 익절 {p.take_profit_pct}% / max_hold {p.max_hold_days}일) ===")
     print(f"  비용 가정: 편도 수수료 {p.fee_pct}% · 매도세 {p.tax_pct}% · 편도 슬리피지 {p.slippage_bps}bp")
+    print(f"  체결: {p.entry_fill} · 동종 대비 5일 필터: {p.min_peer_excess_5d_pct}")
     _print_summary("결과", s)
     if args.json:
         print(json.dumps(s, ensure_ascii=False, indent=2))
 
 
-def candidate_grid(max_hold: int = 3) -> list[tuple[str, Params]]:
+def candidate_grid(max_hold: int = 3, **overrides: Any) -> list[tuple[str, Params]]:
     """The strategy variants under comparison, incumbent first.
 
     Shared by sweep / walkforward / significance so all three judge the
@@ -111,8 +115,11 @@ def candidate_grid(max_hold: int = 3) -> list[tuple[str, Params]]:
     never silently drift to an untested corner. Keep the labels honest —
     they drifted stale once already (said "-2.5/+5" while live had moved
     to -4/+8/below_ma).
+
+    ``overrides`` (entry fill, peer filter, slippage) apply to every
+    candidate alike, so the grid still judges one execution model at a time.
     """
-    return [
+    grid = [
         ("라이브 진입밴드 일봉 proxy(below_ma,ma20,-4/+8)",
          Params(entry_mode="below_ma", ma_period=20, stop_loss_pct=-4, take_profit_pct=8, max_hold_days=max_hold)),
         ("momentum(-4/+8)",
@@ -126,6 +133,17 @@ def candidate_grid(max_hold: int = 3) -> list[tuple[str, Params]]:
         ("momentum 진입넓게(0.5~20)",
          Params(entry_mode="momentum", day_change_max=20, stop_loss_pct=-4, take_profit_pct=8, max_hold_days=max_hold)),
     ]
+    return [(label, replace(p, **overrides)) for label, p in grid] if overrides else grid
+
+
+def _grid_overrides(args) -> dict[str, Any]:
+    """Execution-model flags shared by walkforward and significance."""
+
+    return {
+        "entry_fill": args.entry_fill,
+        "min_peer_excess_5d_pct": args.min_peer_excess_5d,
+        "slippage_bps": args.slippage_bps,
+    }
 
 
 def _sweep(args) -> None:
@@ -146,7 +164,7 @@ def _significance(args) -> None:
         print("캐시 없음 — 먼저 fetch.")
         sys.exit(1)
 
-    grid = candidate_grid(args.max_hold)
+    grid = candidate_grid(args.max_hold, **_grid_overrides(args))
     results = {label: run_backtest(series, p) for label, p in grid}
     incumbent_label = grid[0][0]
 
@@ -253,7 +271,7 @@ def _walkforward(args) -> None:
     if not series:
         print("캐시 없음 — 먼저 fetch.")
         sys.exit(1)
-    grid = [p for _label, p in candidate_grid(args.max_hold)]
+    grid = [p for _label, p in candidate_grid(args.max_hold, **_grid_overrides(args))]
     wf = walk_forward(series, grid, train_days=args.train_days, test_days=args.test_days)
     print(f"\n=== Walk-forward (universe {len(series)}종목, "
           f"train={args.train_days}봉/test={args.test_days}봉) ===")
@@ -296,6 +314,55 @@ def _walkforward(args) -> None:
             },
             ensure_ascii=False, indent=2,
         ))
+
+
+def _fetch_dart(args) -> None:
+    from .dart import fetch_roster
+
+    rows = fetch_roster(args.begin, args.end)
+    print(f"DART 공시 {sum(len(v) for v in rows.values())}건 캐시 ({len(rows)}종목)")
+
+
+def _disclosures(args) -> None:
+    from .dart import load_disclosures
+    from .disclosures import HORIZONS, run_study
+
+    series = load_cache()
+    filings = load_disclosures()
+    if not series or not filings:
+        print("캐시 없음: `fetch`(일봉)와 `fetch-dart`(공시)를 먼저 실행할 것")
+        sys.exit(1)
+    report = run_study(series, filings)
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        return
+
+    print(
+        f"below_ma 에피소드 시작 {report['episodes']}건 · 밴드일 {report['band_days']}건 "
+        f"· 로스터 대비 직전 5일 초과수익 중앙값 {report['median_trailing_excess']:+.2f}%"
+    )
+    print("\n그룹 안/밖의 이후 초과수익(로스터 등가중 대비, %) · 차이 = 안 − 밖 · 월 단위 부트스트랩")
+    print("-" * 96)
+    for name, by_h in report["splits"].items():
+        for h in HORIZONS:
+            r = by_h.get(h)
+            if r is None:
+                print(f"  {name:<26} {h:>2}d  표본 부족")
+                continue
+            print(
+                f"  {name:<26} {h:>2}d  안 {r['mean_yes']:+.3f} (n={r['n_yes']:>4})"
+                f"  밖 {r['mean_no']:+.3f} (n={r['n_no']:>4})"
+                f"  차이 {r['diff']:+.3f}  CI[{r['ci_low']:+.3f},{r['ci_high']:+.3f}]"
+                f"  z {r['z'] if r['z'] is not None else 'n/a'}"
+            )
+    print(
+        f"\n{report['cells']}개 셀 검정 — 귀무가설 하 최대 |z| 기대값 ≈ "
+        f"{report['expected_max_abs_t']} (이걸 못 넘으면 우연과 구분 안 됨)"
+    )
+    print("\n5일 초과수익 2x2 (에피소드 시작, 직전 5세션 공시 × 직전 5일 로스터 대비 낙폭)")
+    for key, cell in report["table_h5"].items():
+        mean = "n/a" if cell["mean"] is None else f"{cell['mean']:+.3f}%"
+        print(f"  {key:<26} n={cell['n']:>4}  {mean}")
 
 
 def _ic(args) -> None:
@@ -452,6 +519,19 @@ def _ic(args) -> None:
                   f"{b['excess_pct']:>+9.3f}%{b['net_pct']:>+9.3f}%{b['t']:>7.2f}")
 
 
+def _add_execution_flags(parser, *, slippage: bool) -> None:
+    parser.add_argument(
+        "--entry-fill", choices=["next_open", "signal_close"], default="next_open",
+        help="진입 체결: next_open(다음날 시가) | signal_close(신호일 종가 = 장 마감 동시호가, 진입 슬리피지 없음)",
+    )
+    parser.add_argument(
+        "--min-peer-excess-5d", type=float, default=None,
+        help="직전 5세션 수익률 − 전 종목 평균이 이 값(퍼센트포인트) 이상일 때만 진입. 기본 off",
+    )
+    if slippage:
+        parser.add_argument("--slippage-bps", type=float, default=0.0, help="편도 불리한 체결 가정(bp)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="backtest.run")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -473,6 +553,7 @@ def main() -> None:
     r.add_argument("--slippage-bps", type=float, default=0.0, help="편도 불리한 체결 가정(bp); 0/5/10으로 민감도 비교")
     r.add_argument("--max-hold", type=int, default=3)
     r.add_argument("--json", action="store_true")
+    _add_execution_flags(r, slippage=False)
 
     sub.add_parser("sweep", help="파라미터 그리드 비교 (in-sample)")
 
@@ -481,6 +562,7 @@ def main() -> None:
     wf.add_argument("--test-days", type=int, default=60, help="test window (거래일 수)")
     wf.add_argument("--max-hold", type=int, default=3)
     wf.add_argument("--json", action="store_true")
+    _add_execution_flags(wf, slippage=True)
 
     sg = sub.add_parser("significance", help="부트스트랩 CI + PBO + Deflated Sharpe")
     sg.add_argument("--blocks", type=int, default=10,
@@ -493,6 +575,7 @@ def main() -> None:
                     help="무작위 진입 대조군 seed 수 (많을수록 p_value 안정)")
     sg.add_argument("--max-hold", type=int, default=3)
     sg.add_argument("--json", action="store_true")
+    _add_execution_flags(sg, slippage=True)
 
     icp = sub.add_parser(
         "ic",
@@ -503,11 +586,33 @@ def main() -> None:
                      help="상위 N 바스켓 크기. 라이브는 max_positions=1이다")
     icp.add_argument("--json", action="store_true")
 
+    fd = sub.add_parser(
+        "fetch-dart",
+        help="로스터 DART 공시(주요사항·거래소공시) 캐시 — DART_API_KEY 환경변수 필요",
+    )
+    fd.add_argument("--begin", default="20240301", help="시작 접수일 YYYYMMDD")
+    fd.add_argument("--end", default=None, help="종료 접수일 YYYYMMDD (기본 오늘)")
+
+    dsc = sub.add_parser(
+        "disclosures",
+        help="공시 있는 눌림 vs 없는 눌림의 이후 초과수익 (사전 고정 설계)",
+    )
+    dsc.add_argument("--json", action="store_true")
+
     args = ap.parse_args()
     if args.cmd == "fetch":
         asyncio.run(_fetch(args))
     elif args.cmd == "ic":
         _ic(args)
+    elif args.cmd == "fetch-dart":
+        if args.end is None:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            args.end = datetime.now(ZoneInfo("Asia/Seoul")).strftime("%Y%m%d")
+        _fetch_dart(args)
+    elif args.cmd == "disclosures":
+        _disclosures(args)
     elif args.cmd == "run":
         _run(args)
     elif args.cmd == "sweep":

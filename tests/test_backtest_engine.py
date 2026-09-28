@@ -2,7 +2,14 @@
 
 import pytest
 
-from backtest.engine import Params, backtest_symbol, run_backtest, _entry_signal, normalize_rows
+from backtest.engine import (
+    Params,
+    _entry_signal,
+    backtest_symbol,
+    normalize_rows,
+    peer_mean_returns,
+    run_backtest,
+)
 
 
 def _bar(d, o, h, l, c):
@@ -165,3 +172,82 @@ def test_invalid_prices_are_not_tradeable(price):
 def test_invalid_backtest_parameters_are_rejected(overrides):
     with pytest.raises(ValueError):
         Params(**overrides)
+
+
+# --- closing-auction fill -------------------------------------------------
+
+
+def test_signal_close_fill_buys_at_the_signal_close_without_entry_slippage():
+    """The closing auction fills every order at one price: no entry spread."""
+
+    bars = [
+        _bar("20260101", 100, 101, 99, 100),
+        _bar("20260102", 100, 104, 100, 103),  # +3% entry signal, close 103
+        _bar("20260103", 104, 105, 103, 104),  # opens above the signal close
+        _bar("20260104", 104, 105, 103, 104),
+    ]
+    p = Params(stop_loss_pct=-4, take_profit_pct=8, max_hold_days=2, entry_fill="signal_close", slippage_bps=10)
+
+    t = backtest_symbol("X", bars, p)[0]
+
+    assert t.entry_date == "20260102"
+    assert t.entry_price == 103  # the signal close, no slippage added
+    assert t.reason == "max_hold" and t.exit_date == "20260104"
+    assert abs(t.exit_price - 104 * (1 - 0.001)) < 1e-9  # exits still pay it
+
+
+def test_signal_close_fill_respects_the_walk_forward_entry_boundary():
+    bars = [
+        _bar("20260101", 100, 101, 99, 100),
+        _bar("20260102", 100, 104, 100, 103),  # signal day = fill day
+        _bar("20260103", 104, 105, 103, 104),
+    ]
+    p = Params(stop_loss_pct=-4, take_profit_pct=8, max_hold_days=1, entry_fill="signal_close")
+
+    assert backtest_symbol("X", bars, p, entry_start_date="20260103") == []
+    assert len(backtest_symbol("X", bars, p, entry_start_date="20260102")) == 1
+
+
+# --- peer filter ----------------------------------------------------------
+
+
+def _peer_series(dip_code_path, days=30, codes=12):
+    """Flat peers at 100; one symbol follows `dip_code_path(i)` instead."""
+
+    series = {}
+    for k in range(codes):
+        closes = [dip_code_path(i) if k == 0 else 100.0 for i in range(days)]
+        series[f"{k:06d}"] = [
+            _bar(f"2026{1 + i // 28:02d}{1 + i % 28:02d}", c, c, c, c) for i, c in enumerate(closes)
+        ]
+    return series
+
+
+def _falls_alone(i):
+    # Slides 1% a session from day 20 while the peers stay flat: by day 23 it
+    # has fallen ~3% alone and sits inside the shallow MA20 band.
+    return 100.0 if i < 20 else 100.0 * (0.99 ** (i - 19))
+
+
+def test_peer_mean_returns_average_the_lookback_return_across_symbols():
+    series = _peer_series(_falls_alone)
+    peers = peer_mean_returns(series)
+
+    day_25 = normalize_rows(series["000000"])[25]["d"]
+    own = (_falls_alone(25) / _falls_alone(20) - 1) * 100
+    assert abs(peers[day_25] - own / 12) < 1e-9
+
+
+def test_peer_filter_drops_a_dip_taken_alone_and_keeps_it_when_off():
+    series = _peer_series(_falls_alone)
+    base = Params(entry_mode="below_ma", ma_period=20, stop_loss_pct=-10, take_profit_pct=10, max_hold_days=2)
+
+    def entries(threshold):
+        p = Params(**{**base.__dict__, "min_peer_excess_5d_pct": threshold})
+        return [t.entry_date for t in run_backtest(series, p).trades]
+
+    # Two band signals: day 20, 0.9%p below the flat peers over 5 sessions,
+    # and day 23, 3.6%p below. Entries fill at the next open.
+    assert entries(None) == ["20260122", "20260125"]
+    assert entries(-1.5) == ["20260122"]
+    assert entries(-50) == ["20260122", "20260125"]
