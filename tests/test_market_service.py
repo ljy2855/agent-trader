@@ -201,3 +201,34 @@ def test_market_snapshot_aggregates_indices_leaders_and_watchlist() -> None:
     assert len(result["leaders"]["gainers"]) == 2
     assert result["watchlist_details"][0]["quote"]["stk_nm"] == "삼성전자"
     assert result["watchlist_details"][0]["orderbook"]["tot_buy_req"] == "15000"
+
+
+def test_stock_detail_bundle_can_reuse_ttl_cache() -> None:
+    """Repeated detail reads should avoid quote/orderbook/daily API churn."""
+
+    market_module._STOCK_DETAIL_CACHE.clear()
+    client = DummyClient()
+
+    first = asyncio.run(
+        market_module.get_stock_detail_bundle(
+            client,
+            stock_code="005930",
+            cache_ttl_seconds=60,
+        )
+    )
+    second = asyncio.run(
+        market_module.get_stock_detail_bundle(
+            client,
+            stock_code="005930",
+            cache_ttl_seconds=60,
+        )
+    )
+
+    assert first["success"] is True
+    assert second["success"] is True
+    assert second["cache_hit"] is True
+    assert [call["headers"]["api-id"] for call in client.calls] == [
+        "ka10007",
+        "ka10004",
+        "ka10005",
+    ]

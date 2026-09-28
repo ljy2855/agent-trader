@@ -52,6 +52,23 @@ def _list_from_key(key: str) -> RecordExtractor:
     return extractor
 
 
+def _strict_list_from_key(key: str) -> RecordExtractor:
+    """Extract a broker list while rejecting malformed "successful" payloads.
+
+    For order reconciliation, a missing list is not equivalent to an empty
+    list: only the latter is broker absence evidence.
+    """
+
+    def extractor(response_data: Any) -> list[Any]:
+        if isinstance(response_data, dict):
+            value = response_data.get(key)
+            if isinstance(value, list):
+                return value
+        raise ValueError(f"Kiwoom response missing list field {key!r}")
+
+    return extractor
+
+
 def _wrap_dict_or_list(response_data: Any) -> list[Any]:
     """Preserve top-level dict responses while still accepting list payloads."""
 
@@ -177,7 +194,11 @@ async def _run_account_query(
 
             response_cont_yn = response.headers.get("cont-yn", "N")
             response_next_key = response.headers.get("next-key")
-            if response_cont_yn == "Y" and response_next_key:
+            if response_cont_yn == "Y":
+                if not response_next_key:
+                    raise RuntimeError(
+                        "pagination incomplete: cont-yn=Y without next-key"
+                    )
                 cont_yn = "Y"
                 next_key = response_next_key
                 continue
@@ -262,6 +283,37 @@ async def get_account_evaluation(
         extractor=_wrap_dict_or_list,
         max_requests=max_requests,
         exception_message="Account evaluation endpoint not yet implemented or failed to connect",
+    )
+
+
+async def get_daily_estimated_asset(
+    client: KiwoomClient,
+    start_date: str,
+    end_date: str,
+    max_requests: int = 10,
+) -> dict[str, Any]:
+    """Get daily estimated deposit asset (kt00002) over a date range.
+
+    Returns a row per day with ``dt`` and ``prsm_dpst_aset_amt`` — the
+    server-side total-asset time series for the dashboard chart. Kiwoom
+    keeps the history, so no local persistence is needed.
+    """
+
+    return await _run_account_query(
+        client,
+        api_info=ACCOUNT_APIS.daily_estimated_asset,
+        request_data={
+            "start_dt": start_date,
+            "end_dt": end_date,
+        },
+        context={
+            "start_date": start_date,
+            "end_date": end_date,
+        },
+        result_key="daily_estimated_asset_data",
+        extractor=_list_from_key("daly_prsm_dpst_aset_amt_prst"),
+        max_requests=max_requests,
+        exception_message="Daily estimated asset endpoint not yet implemented or failed to connect",
     )
 
 
@@ -382,7 +434,7 @@ async def get_execution_info(
             "ord_no": ord_no,
         },
         result_key="execution_data",
-        extractor=_list_from_key("cntr"),
+        extractor=_strict_list_from_key("cntr"),
         max_requests=max_requests,
         exception_message="Execution info endpoint not yet implemented or failed to connect",
     )
@@ -441,7 +493,20 @@ async def get_unexecuted_orders(
     stk_cd: str = "",
     max_requests: int = 10,
 ) -> dict[str, Any]:
-    """Get unexecuted orders with automatic pagination."""
+    """Get ka10075 unexecuted orders with automatic pagination.
+
+    ``all_stk_tp`` MUST stay in the request body. `kiwoom_api_spec.md` omits it
+    from the ka10075 body table, and Phase 0 briefly dropped it on that basis --
+    but the live endpoint rejects the request outright::
+
+        입력 값 오류입니다[1511:필수 입력 값에 값이 존재하지 않습니다.
+        필수입력 파라미터=all_stk_tp]
+
+    Observed 2026-07-28 against https://api.kiwoom.com. The vendored spec is
+    incomplete here; the broker is the authority. Dropping this field breaks
+    every open-order read, which silently degrades the oversell guard, the
+    stale-unfilled cancel path and the UNKNOWN protective-sell release.
+    """
 
     request_data = {
         "all_stk_tp": all_stk_tp,
@@ -462,15 +527,42 @@ async def get_unexecuted_orders(
             "stk_cd": stk_cd,
         },
         result_key="unexecuted_orders_data",
-        extractor=_list_from_key("oso"),
+        extractor=_strict_list_from_key("oso"),
         max_requests=max_requests,
         exception_message="Unexecuted orders endpoint not yet implemented or failed to connect",
     )
 
 
+async def get_daily_trading_journal(
+    client: KiwoomClient,
+    ottks_tp: str = "2",
+    ch_crd_tp: str = "0",
+    max_requests: int = 10,
+) -> dict[str, Any]:
+    """Get today's trading journal (당일매매일지) using Kiwoom's `ka10170`.
+
+    Args:
+        ottks_tp: 단주구분. 1=당일매수에 대한 당일매도, 2=당일매도 전체
+        ch_crd_tp: 현금신용구분. 0=전체, 1=현금매매만, 2=신용매매만
+    """
+
+    return await _run_account_query(
+        client,
+        api_info=ACCOUNT_APIS.daily_trading_journal,
+        request_data={"ottks_tp": ottks_tp, "ch_crd_tp": ch_crd_tp},
+        context={"ottks_tp": ottks_tp, "ch_crd_tp": ch_crd_tp},
+        result_key="trading_journal_data",
+        extractor=_list_from_key("tdy_trde_diary"),
+        max_requests=max_requests,
+        exception_message="Daily trading journal endpoint not yet implemented or failed to connect",
+    )
+
+
 __all__ = [
     "get_daily_realized_profit_by_stock",
+    "get_daily_trading_journal",
     "get_account_evaluation",
+    "get_daily_estimated_asset",
     "get_account_current_status",
     "get_daily_account_profit_detail",
     "get_orderable_amount",

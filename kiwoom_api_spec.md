@@ -5767,7 +5767,14 @@
 #### Body
 | Name | Type | Required | Description | Example | Note |
 |---|---|:---:|---|---|---|
+| `inds_cd` | String | Y | 업종코드 | 001:종합(KOSPI), 002:대형주, 003:중형주, 004:소형주 101:종합(KOSDAQ), 201:KOSPI200, 302:KOSTAR, 701: KRX100 나머지 ※ 업종코드 참고 | 3 |
 | `base_dt` | String | Y | 기준일자 | YYYYMMDD | 8 |
+
+> ⚠️ **`inds_cd` 없이 호출하면 거부된다** — `base_dt`만 보내면
+> `[1511:필수입력 파라미터=inds_cd]`. 2026-09-21 실엔드포인트 확인.
+> 이 표에 원래 `inds_cd`가 없었다(ka10075 `all_stk_tp`와 같은 누락).
+> 키움 공식 스펙(`src/constants/vendor/kiwoom_request_fields.json`)에는
+> 처음부터 `Required: Y`로 있었다 — **틀린 건 이 손으로 쓴 표였다.**
 
 
 ### Response
@@ -5781,7 +5788,8 @@
 #### Body
 | Name | Type | Required | Description | Example | Note |
 |---|---|:---:|---|---|---|
-| `inds_dt_pole_qry` | LIST | N | 업종일봉조회 |  |  |
+| `inds_cd` | String | N | 업종코드 | 요청값 echo |  |
+| `inds_dt_pole_qry` | LIST | N | 업종일봉조회 | 1회 약 600행 |  |
 | `- cur_prc` | String | N | 현재가 | 지수 값은 소수점 제거 후 100배 값으로 반환 | 20 |
 | `- trde_qty` | String | N | 거래량 |  | 20 |
 | `- dt` | String | N | 일자 |  | 20 |
@@ -5905,7 +5913,11 @@
 #### Body
 | Name | Type | Required | Description | Example | Note |
 |---|---|:---:|---|---|---|
+| `mrkt_tp` | String | Y | 시장구분 | 0:코스피, 1:코스닥, 2:코스피200 | 20 |
 | `inds_cd` | String | Y | 업종코드 | 001:종합(KOSPI), 002:대형주, 003:중형주, 004:소형주 101:종합(KOSDAQ), 201:KOSPI200, 302:KOSTAR, 701: KRX100 나머지 ※ 업종코드 참고 | 3 |
+
+> ⚠️ **`mrkt_tp`도 필수다** — `inds_cd`만 보내면
+> `[1511:필수입력 파라미터=mrkt_tp]`. 2026-09-21 실엔드포인트 확인.
 
 
 ### Response

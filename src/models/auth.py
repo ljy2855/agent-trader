@@ -15,11 +15,21 @@ class TokenIssueRequest(BaseModel):
 
 
 class TokenIssueResponse(BaseModel):
-    """Response from Kiwoom OAuth token issuance API."""
+    """Response from Kiwoom OAuth token issuance API.
 
-    expires_dt: str = Field(description="Token expiration datetime (YYYYMMDDHHMMSS format)")
-    token_type: str = Field(description="Token type, typically 'bearer'")
-    token: str = Field(description="Access token for API calls")
+    On the success path Kiwoom returns return_code=0 plus expires_dt /
+    token_type / token. On auth failures (e.g. transient
+    "인증에 실패했습니다", return_code=3) those three credential fields
+    are absent — making them required would crash pydantic validation
+    before the caller can read return_msg, masking the real error
+    behind a confusing ValidationError (SWO-183, 2026-04-28).
+    """
+
+    expires_dt: str = Field(
+        default="", description="Token expiration datetime (YYYYMMDDHHMMSS format)"
+    )
+    token_type: str = Field(default="", description="Token type, typically 'bearer'")
+    token: str = Field(default="", description="Access token for API calls")
     return_code: int = Field(description="Return code from Kiwoom API (0 for success)")
     return_msg: str = Field(description="Return message from Kiwoom API")
 

@@ -48,26 +48,42 @@ class TokenManager:
         return datetime.now() + buffer_time < self._expires_at
 
     async def _issue_new_token(self) -> None:
-        """Issue a new token from Kiwoom OpenAPI."""
+        """Issue a new token from Kiwoom OpenAPI.
+
+        Retries once on transient auth failures (return_code != 0): Kiwoom
+        sometimes returns "인증에 실패했습니다" on the very first call
+        after rotation, then succeeds on the immediate retry (SWO-183,
+        2026-04-28). One retry covers that without masking persistent
+        credential errors.
+        """
         from .kiwoom_client import KiwoomClient
-        
-        client = KiwoomClient(self._settings)
-        try:
-            response = await client.request_access_token()
-            
-            # Check if request was successful
-            if response.return_code != 0:
-                raise Exception(f"Token issuance failed: {response.return_msg}")
-            
-            self._token = response.token
-            self._token_type = response.token_type
-            
-            # Parse expiration datetime (YYYYMMDDHHMMSS format)
-            expires_str = response.expires_dt
-            self._expires_at = datetime.strptime(expires_str, "%Y%m%d%H%M%S")
-            
-        finally:
-            await client.close()
+
+        last_error: str | None = None
+        for attempt in (1, 2):
+            client = KiwoomClient(self._settings)
+            try:
+                response = await client.request_access_token()
+                if response.return_code != 0 or not response.token:
+                    last_error = (
+                        f"return_code={response.return_code} "
+                        f"return_msg={response.return_msg!r}"
+                    )
+                    if attempt == 1:
+                        # Brief backoff before retry — Kiwoom recovers within
+                        # a couple hundred ms on transient auth failures.
+                        await asyncio.sleep(0.5)
+                        continue
+                    raise Exception(f"Token issuance failed: {last_error}")
+
+                self._token = response.token
+                self._token_type = response.token_type
+                # Parse expiration datetime (YYYYMMDDHHMMSS format)
+                self._expires_at = datetime.strptime(
+                    response.expires_dt, "%Y%m%d%H%M%S"
+                )
+                return
+            finally:
+                await client.close()
 
     async def force_refresh(self) -> str:
         """
@@ -79,6 +95,14 @@ class TokenManager:
         async with self._lock:
             await self._issue_new_token()
             return self._token
+
+    async def invalidate(self) -> None:
+        """Drop the currently cached token so the next call reissues it."""
+
+        async with self._lock:
+            self._token = None
+            self._token_type = None
+            self._expires_at = None
 
     def get_token_info(self) -> dict:
         """Get current token information for debugging."""

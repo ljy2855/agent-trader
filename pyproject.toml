@@ -5,15 +5,13 @@ description = "Server scaffolding for Kiwoom OpenAPI MCP integration"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "fastmcp>=0.1.0",
+    "fastmcp==4.0.10",  # 운영 이미지와 같은 버전 — unpinned이던 2026-09-27에 테스트(2.x)와 운영(4.x)이 갈라져 배포가 터졌다
     "httpx>=0.27.0",
     "pydantic-settings>=2.2.1",
     "starlette>=0.48.0",
     "uvicorn>=0.30.0",
+    "websockets>=15.0.1",
 ]
-
-[project.scripts]
-kiwoom-strategy-cycle = "src.strategy_cycle:cli"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

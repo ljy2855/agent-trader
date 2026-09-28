@@ -50,6 +50,11 @@ class Settings(BaseSettings):
         description="Whether to use mock API endpoint (for KRX testing)",
     )
     timeout_seconds: float = Field(10.0, description="HTTP client timeout in seconds")
+    allow_direct_live_orders: bool = Field(
+        False,
+        alias="KIWOOM_ALLOW_DIRECT_LIVE_ORDERS",
+        description="Allow live MCP/manual and legacy background orders outside the watcher risk gates",
+    )
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

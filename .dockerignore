@@ -1,0 +1,27 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+.pytest_cache
+.python-version
+.venv
+.playwright-cli
+__pycache__
+*.pyc
+output
+tests
+kiwoom_api_spec.md
+*.pdf
+
+# automation/: ship only the helper scripts the container actually runs.
+# Secrets and host-local state must NOT be baked into the image — they are
+# delivered via K8s secrets (kiwoom-watcher-env, multica-cli-config) and PVCs.
+automation/discord_webhook_url
+automation/memory*.md
+automation/eligible_carryover_*.json
+automation/*.bak
+
+# docs/site 빌드 도구·산출물 — 이미지에 안 들어가지만 빌드 컨텍스트가 커진다
+docs/site/.venv
+docs/site/.build

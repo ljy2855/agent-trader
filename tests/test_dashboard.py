@@ -33,8 +33,9 @@ def test_build_dashboard_snapshot_normalizes_nested_data(monkeypatch) -> None:
                 {
                     "acnt_nm": "테스트계좌",
                     "brch_nm": "테스트지점",
-                    "tot_est_amt": "1234500",
+                    "prsm_dpst_aset_amt": "1234500",
                     "aset_evlt_amt": "1200000",
+                    "tot_est_amt": "142000",
                     "entr": "300000",
                     "d2_entra": "320000",
                     "tdy_lspft_amt": "15000",
@@ -172,7 +173,22 @@ def test_build_dashboard_snapshot_normalizes_nested_data(monkeypatch) -> None:
             ],
         }
 
+    async def fake_get_daily_estimated_asset(client, start_date, end_date, max_requests=10):
+        return {
+            "success": True,
+            "api_id": "kt00002",
+            "return_code": 0,
+            "return_msg": "ok",
+            "total_records": 3,
+            "daily_estimated_asset_data": [
+                {"dt": "20260322", "prsm_dpst_aset_amt": "1200000"},
+                {"dt": "20260323", "prsm_dpst_aset_amt": "1220000"},
+                {"dt": "20260324", "prsm_dpst_aset_amt": "1234500"},
+            ],
+        }
+
     monkeypatch.setattr(dashboard_module.account, "get_account_evaluation", fake_get_account_evaluation)
+    monkeypatch.setattr(dashboard_module.account, "get_daily_estimated_asset", fake_get_daily_estimated_asset)
     monkeypatch.setattr(dashboard_module.account, "get_account_current_status", fake_get_account_current_status)
     monkeypatch.setattr(dashboard_module.account, "get_daily_account_profit_detail", fake_get_daily_account_profit_detail)
     monkeypatch.setattr(dashboard_module.account, "get_daily_realized_profit_by_stock", fake_get_daily_realized_profit_by_stock)
@@ -191,10 +207,26 @@ def test_build_dashboard_snapshot_normalizes_nested_data(monkeypatch) -> None:
 
     assert payload["environment"]["mode"] == "mock"
     assert payload["identity"]["account_name"] == "테스트계좌"
-    assert payload["summary"][0]["value"] == "1234500"
+    # First card is the new explicit "예수금 + 보유평가" combined total.
+    assert payload["summary"][0]["label"] == "총 자산 (예수금+보유평가)"
+    assert payload["summary"][0]["highlight"] is True
+    # Cash (entr=300000) + holdings evaluation (evlt_amt=142000) = 442000.
+    assert payload["summary"][0]["value"] == "442000"
+    assert payload["summary"][0]["detail"] == "예수금 300,000원 + 보유 평가 142,000원"
+    # Kiwoom-reported total assets is now further down the list.
+    assert any(
+        card["label"] == "총 추정자산 (Kiwoom)" and card["value"] == "1234500"
+        for card in payload["summary"]
+    )
     assert payload["tables"]["holdings"]["rows"][0]["stock_name"] == "삼성전자"
     assert payload["tables"]["order_status"]["rows"][0]["status"] == "접수"
     assert payload["tables"]["executions"]["rows"][0]["filled_price"] == "71000"
+    # Total-asset time series (kt00002): sorted points + range delta.
+    series = payload["asset_series"]
+    assert [p["date"] for p in series["points"]] == ["2026-03-22", "2026-03-23", "2026-03-24"]
+    assert series["points"][0]["value"] == 1200000
+    assert series["start_value"] == 1200000 and series["end_value"] == 1234500
+    assert series["change"] == 34500
     assert payload["sources"][1]["status"] == "unsupported"
 
 

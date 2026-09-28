@@ -1,0 +1,629 @@
+{
+ "_note": "Request-body field names and required flags for the APIs this repo calls. Extracted subset (21 of 337) -- reference data for a conformance test, not vendored code. The broker remains the authority: this file marks kt10001 ord_uv Required=N, yet the broker rejects a 보통 limit without it (308003, 2026-08-31).",
+ "_retrieved": "2026-08-31",
+ "_source": "Kiwoom-Securities/Kiwoom-REST-API kiwoom/_data/kiwoom_api_spec.json",
+ "_source_revision": "e24843fc82a78fe7b6ec68625b57f267eda95e77",
+ "apis": {
+  "au10001": {
+   "api_name": "접근토큰 발급",
+   "menu_path": "OAuth 인증 > 접근토큰발급 > 접근토큰 발급(au10001)",
+   "request_body": [
+    {
+     "description": "client_credentials 입력",
+     "element": "grant_type",
+     "name": "grant_type",
+     "required": "Y"
+    },
+    {
+     "description": "",
+     "element": "appkey",
+     "name": "앱키",
+     "required": "Y"
+    },
+    {
+     "description": "",
+     "element": "secretkey",
+     "name": "시크릿키",
+     "required": "Y"
+    }
+   ],
+   "url": "/oauth2/token"
+  },
+  "au10002": {
+   "api_name": "접근토큰폐기",
+   "menu_path": "OAuth 인증 > 접근토큰폐기 > 접근토큰폐기(au10002)",
+   "request_body": [
+    {
+     "description": "",
+     "element": "appkey",
+     "name": "앱키",
+     "required": "Y"
+    },
+    {
+     "description": "",
+     "element": "secretkey",
+     "name": "시크릿키",
+     "required": "Y"
+    },
+    {
+     "description": "",
+     "element": "token",
+     "name": "접근토큰",
+     "required": "Y"
+    }
+   ],
+   "url": "/oauth2/revoke"
+  },
+  "ka10004": {
+   "api_name": "주식호가요청",
+   "menu_path": "국내주식 > 시세 > 주식호가요청(ka10004)",
+   "request_body": [
+    {
+     "description": "거래소별 종목코드\n(KRX:039490,NXT:039490_NX,SOR:039490_AL)",
+     "element": "stk_cd",
+     "name": "종목코드",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/mrkcond"
+  },
+  "ka10005": {
+   "api_name": "주식일주월시분요청",
+   "menu_path": "국내주식 > 시세 > 주식일주월시분요청(ka10005)",
+   "request_body": [
+    {
+     "description": "거래소별 종목코드\n(KRX:039490,NXT:039490_NX,SOR:039490_AL)",
+     "element": "stk_cd",
+     "name": "종목코드",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/mrkcond"
+  },
+  "ka10007": {
+   "api_name": "시세표성정보요청",
+   "menu_path": "국내주식 > 시세 > 시세표성정보요청(ka10007)",
+   "request_body": [
+    {
+     "description": "거래소별 종목코드\n(KRX:039490,NXT:039490_NX,SOR:039490_AL)",
+     "element": "stk_cd",
+     "name": "종목코드",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/mrkcond"
+  },
+  "ka10027": {
+   "api_name": "전일대비등락률상위요청",
+   "menu_path": "국내주식 > 순위정보 > 전일대비등락률상위요청(ka10027)",
+   "request_body": [
+    {
+     "description": "000:전체, 001:코스피, 101:코스닥",
+     "element": "mrkt_tp",
+     "name": "시장구분",
+     "required": "Y"
+    },
+    {
+     "description": "1:상승률, 2:상승폭, 3:하락률, 4:하락폭, 5:보합",
+     "element": "sort_tp",
+     "name": "정렬구분",
+     "required": "Y"
+    },
+    {
+     "description": "0000:전체조회, 0010:만주이상, 0050:5만주이상, 0100:10만주이상, 0150:15만주이상, 0200:20만주이상, 0300:30만주이상, 0500:50만주이상, 1000:백만주이상",
+     "element": "trde_qty_cnd",
+     "name": "거래량조건",
+     "required": "Y"
+    },
+    {
+     "description": "0:전체조회, 1:관리종목제외, 4:우선주+관리주제외, 3:우선주제외, 5:증100제외, 6:증100만보기, 7:증40만보기, 8:증30만보기, 9:증20만보기, 11:정리매매종목제외, 12:증50만보기, 13:증60만보기, 14:ETF제외, 15:스펙제외, 16:ETF+ETN제외",
+     "element": "stk_cnd",
+     "name": "종목조건",
+     "required": "Y"
+    },
+    {
+     "description": "0:전체조회, 1:신용융자A군, 2:신용융자B군, 3:신용융자C군, 4:신용융자D군, 7:신용융자E군, 9:신용융자전체",
+     "element": "crd_cnd",
+     "name": "신용조건",
+     "required": "Y"
+    },
+    {
+     "description": "0:불 포함, 1:포함",
+     "element": "updown_incls",
+     "name": "상하한포함",
+     "required": "Y"
+    },
+    {
+     "description": "0:전체조회, 1:1천원미만, 2:1천원~2천원, 3:2천원~5천원, 4:5천원~1만원, 5:1만원이상, 8:1천원이상, 10: 1만원미만",
+     "element": "pric_cnd",
+     "name": "가격조건",
+     "required": "Y"
+    },
+    {
+     "description": "0:전체조회, 3:3천만원이상, 5:5천만원이상, 10:1억원이상, 30:3억원이상, 50:5억원이상, 100:10억원이상, 300:30억원이상, 500:50억원이상, 1000:100억원이상, 3000:300억원이상, 5000:500억원이상",
+     "element": "trde_prica_cnd",
+     "name": "거래대금조건",
+     "required": "Y"
+    },
+    {
+     "description": "1:KRX, 2:NXT 3.통합",
+     "element": "stex_tp",
+     "name": "거래소구분",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/rkinfo"
+  },
+  "ka10030": {
+   "api_name": "당일거래량상위요청",
+   "menu_path": "국내주식 > 순위정보 > 당일거래량상위요청(ka10030)",
+   "request_body": [
+    {
+     "description": "000:전체, 001:코스피, 101:코스닥",
+     "element": "mrkt_tp",
+     "name": "시장구분",
+     "required": "Y"
+    },
+    {
+     "description": "1:거래량, 2:거래회전율, 3:거래대금",
+     "element": "sort_tp",
+     "name": "정렬구분",
+     "required": "Y"
+    },
+    {
+     "description": "0:관리종목 포함, 1:관리종목 미포함, 3:우선주제외, 11:정리매매종목제외, 4:관리종목, 우선주제외, 5:증100제외, 6:증100마나보기, 13:증60만보기, 12:증50만보기, 7:증40만보기, 8:증30만보기, 9:증20만보기, 14:ETF제외, 15:스팩제외, 16:ETF+ETN제외",
+     "element": "mang_stk_incls",
+     "name": "관리종목포함",
+     "required": "Y"
+    },
+    {
+     "description": "0:전체조회, 9:신용융자전체, 1:신용융자A군, 2:신용융자B군, 3:신용융자C군, 4:신용융자D군, 8:신용대주",
+     "element": "crd_tp",
+     "name": "신용구분",
+     "required": "Y"
+    },
+    {
+     "description": "0:전체조회, 5:5천주이상, 10:1만주이상, 50:5만주이상, 100:10만주이상, 200:20만주이상, 300:30만주이상, 500:500만주이상, 1000:백만주이상",
+     "element": "trde_qty_tp",
+     "name": "거래량구분",
+     "required": "Y"
+    },
+    {
+     "description": "0:전체조회, 1:1천원미만, 2:1천원이상, 3:1천원~2천원, 4:2천원~5천원, 5:5천원이상, 6:5천원~1만원, 10:1만원미만, 7:1만원이상, 8:5만원이상, 9:10만원이상",
+     "element": "pric_tp",
+     "name": "가격구분",
+     "required": "Y"
+    },
+    {
+     "description": "0:전체조회, 1:1천만원이상, 3:3천만원이상, 4:5천만원이상, 10:1억원이상, 30:3억원이상, 50:5억원이상, 100:10억원이상, 300:30억원이상, 500:50억원이상, 1000:100억원이상, 3000:300억원이상, 5000:500억원이상",
+     "element": "trde_prica_tp",
+     "name": "거래대금구분",
+     "required": "Y"
+    },
+    {
+     "description": "0:전체조회, 1:장중, 2:장전시간외, 3:장후시간외",
+     "element": "mrkt_open_tp",
+     "name": "장운영구분",
+     "required": "Y"
+    },
+    {
+     "description": "1:KRX, 2:NXT 3.통합",
+     "element": "stex_tp",
+     "name": "거래소구분",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/rkinfo"
+  },
+  "ka10032": {
+   "api_name": "거래대금상위요청",
+   "menu_path": "국내주식 > 순위정보 > 거래대금상위요청(ka10032)",
+   "request_body": [
+    {
+     "description": "000:전체, 001:코스피, 101:코스닥",
+     "element": "mrkt_tp",
+     "name": "시장구분",
+     "required": "Y"
+    },
+    {
+     "description": "0:관리종목 미포함, 1:관리종목 포함",
+     "element": "mang_stk_incls",
+     "name": "관리종목포함",
+     "required": "Y"
+    },
+    {
+     "description": "1:KRX, 2:NXT 3.통합",
+     "element": "stex_tp",
+     "name": "거래소구분",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/rkinfo"
+  },
+  "ka10060": {
+   "api_name": "종목별투자자기관별차트요청",
+   "menu_path": "국내주식 > 차트 > 종목별투자자기관별차트요청(ka10060)",
+   "request_body": [
+    {
+     "description": "YYYYMMDD",
+     "element": "dt",
+     "name": "일자",
+     "required": "Y"
+    },
+    {
+     "description": "거래소별 종목코드\n(KRX:039490,NXT:039490_NX,SOR:039490_AL)",
+     "element": "stk_cd",
+     "name": "종목코드",
+     "required": "Y"
+    },
+    {
+     "description": "1:금액, 2:수량",
+     "element": "amt_qty_tp",
+     "name": "금액수량구분",
+     "required": "Y"
+    },
+    {
+     "description": "0:순매수, 1:매수, 2:매도",
+     "element": "trde_tp",
+     "name": "매매구분",
+     "required": "Y"
+    },
+    {
+     "description": "1000:천주, 1:단주",
+     "element": "unit_tp",
+     "name": "단위구분",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/chart"
+  },
+  "ka10075": {
+   "api_name": "미체결요청",
+   "menu_path": "국내주식 > 계좌 > 미체결요청(ka10075)",
+   "request_body": [
+    {
+     "description": "0:전체, 1:종목",
+     "element": "all_stk_tp",
+     "name": "전체종목구분",
+     "required": "Y"
+    },
+    {
+     "description": "0:전체, 1:매도, 2:매수",
+     "element": "trde_tp",
+     "name": "매매구분",
+     "required": "Y"
+    },
+    {
+     "description": "종목코드 6자리",
+     "element": "stk_cd",
+     "name": "종목코드",
+     "required": "N"
+    },
+    {
+     "description": "0 : 통합, 1 : KRX, 2 : NXT",
+     "element": "stex_tp",
+     "name": "거래소구분",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/acnt"
+  },
+  "ka10076": {
+   "api_name": "체결요청",
+   "menu_path": "국내주식 > 계좌 > 체결요청(ka10076)",
+   "request_body": [
+    {
+     "description": "종목코드 6자리",
+     "element": "stk_cd",
+     "name": "종목코드",
+     "required": "N"
+    },
+    {
+     "description": "0:전체, 1:종목",
+     "element": "qry_tp",
+     "name": "조회구분",
+     "required": "Y"
+    },
+    {
+     "description": "0:전체, 1:매도, 2:매수",
+     "element": "sell_tp",
+     "name": "매도수구분",
+     "required": "Y"
+    },
+    {
+     "description": "검색 기준 값으로 입력한 주문번호 보다 과거에 체결된 내역이 조회됩니다.",
+     "element": "ord_no",
+     "name": "주문번호",
+     "required": "N"
+    },
+    {
+     "description": "0 : 통합, 1 : KRX, 2 : NXT",
+     "element": "stex_tp",
+     "name": "거래소구분",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/acnt"
+  },
+  "ka10081": {
+   "api_name": "주식일봉차트조회요청",
+   "menu_path": "국내주식 > 차트 > 주식일봉차트조회요청(ka10081)",
+   "request_body": [
+    {
+     "description": "거래소별 종목코드\n(KRX:039490,NXT:039490_NX,SOR:039490_AL)",
+     "element": "stk_cd",
+     "name": "종목코드",
+     "required": "Y"
+    },
+    {
+     "description": "YYYYMMDD",
+     "element": "base_dt",
+     "name": "기준일자",
+     "required": "Y"
+    },
+    {
+     "description": "0 or 1 / 수정주가 적용을 원하시는 경우, 권리발생일 이후 일자를 base_dt에 넣어 조회 또는 연속조회해주시기 바랍니다. 예를 들어 삼성전자 2018년 05월 04일 (액면분할 권리발생일)을 base_dt에 넣고 수정주가적용(1)로 조회하면 2018년 05월 04일 이전 데이터는 수정주가 적용된 3만원대 가격이 나옵니다. 연속조회도 동일합니다. 권리 발생일 이전인 2018년 05월 03일 이전 일자로 base_dt 조회 시 수정주가 적용되지 않아 200만원 이상 가격대가 나옵니다. 수정주가 적용을 원하는 과거 차트 데이터 조회를 위해서는 해당 권리발생일 이후로 base_dt를 세팅하고, 수정주가 적용(1)로 세팅하고 조회 및 연속조회하여야합니다.",
+     "element": "upd_stkpc_tp",
+     "name": "수정주가구분",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/chart"
+  },
+  "ka10170": {
+   "api_name": "당일매매일지요청",
+   "menu_path": "국내주식 > 계좌 > 당일매매일지요청(ka10170)",
+   "request_body": [
+    {
+     "description": "YYYYMMDD(공백입력시 금일데이터,최근 2개월까지 제공)",
+     "element": "base_dt",
+     "name": "기준일자",
+     "required": "N"
+    },
+    {
+     "description": "1:당일매수에 대한 당일매도,2:당일매도 전체",
+     "element": "ottks_tp",
+     "name": "단주구분",
+     "required": "Y"
+    },
+    {
+     "description": "0:전체, 1:현금매매만, 2:신용매매만",
+     "element": "ch_crd_tp",
+     "name": "현금신용구분",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/acnt"
+  },
+  "ka20001": {
+   "api_name": "업종현재가요청",
+   "menu_path": "국내주식 > 업종 > 업종현재가요청(ka20001)",
+   "request_body": [
+    {
+     "description": "0:코스피, 1:코스닥, 2:코스피200",
+     "element": "mrkt_tp",
+     "name": "시장구분",
+     "required": "Y"
+    },
+    {
+     "description": "001:종합(KOSPI), 002:대형주, 003:중형주, 004:소형주 101:종합(KOSDAQ), 201:KOSPI200, 302:KOSTAR, 701: KRX100 나머지 ※ 업종코드 참고",
+     "element": "inds_cd",
+     "name": "업종코드",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/sect"
+  },
+  "ka20003": {
+   "api_name": "전업종지수요청",
+   "menu_path": "국내주식 > 업종 > 전업종지수요청(ka20003)",
+   "request_body": [
+    {
+     "description": "001:종합(KOSPI), 101:종합(KOSDAQ)",
+     "element": "inds_cd",
+     "name": "업종코드",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/sect"
+  },
+  "ka20006": {
+   "api_name": "업종일봉조회요청",
+   "menu_path": "국내주식 > 차트 > 업종일봉조회요청(ka20006)",
+   "request_body": [
+    {
+     "description": "001:종합(KOSPI), 002:대형주, 003:중형주, 004:소형주 101:종합(KOSDAQ), 201:KOSPI200, 302:KOSTAR, 701: KRX100 나머지 ※ 업종코드 참고",
+     "element": "inds_cd",
+     "name": "업종코드",
+     "required": "Y"
+    },
+    {
+     "description": "YYYYMMDD",
+     "element": "base_dt",
+     "name": "기준일자",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/chart"
+  },
+  "kt00004": {
+   "api_name": "계좌평가현황요청",
+   "menu_path": "국내주식 > 계좌 > 계좌평가현황요청(kt00004)",
+   "request_body": [
+    {
+     "description": "0:전체, 1:상장폐지종목제외",
+     "element": "qry_tp",
+     "name": "상장폐지조회구분",
+     "required": "Y"
+    },
+    {
+     "description": "KRX:한국거래소,NXT:넥스트트레이드",
+     "element": "dmst_stex_tp",
+     "name": "국내거래소구분",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/acnt"
+  },
+  "kt10000": {
+   "api_name": "주식 매수주문",
+   "menu_path": "국내주식 > 주문 > 주식 매수주문(kt10000)",
+   "request_body": [
+    {
+     "description": "KRX,NXT,SOR",
+     "element": "dmst_stex_tp",
+     "name": "국내거래소구분",
+     "required": "Y"
+    },
+    {
+     "description": "",
+     "element": "stk_cd",
+     "name": "종목코드",
+     "required": "Y"
+    },
+    {
+     "description": "단위: 1주",
+     "element": "ord_qty",
+     "name": "주문수량",
+     "required": "Y"
+    },
+    {
+     "description": "단위: 원",
+     "element": "ord_uv",
+     "name": "주문단가",
+     "required": "N"
+    },
+    {
+     "description": "0:보통 , 3:시장가 , 5:조건부지정가 , 81:장마감후시간외 , 61:장시작전시간외, 62:시간외단일가 , 6:최유리지정가 , 7:최우선지정가 , 10:보통(IOC) , 13:시장가(IOC) , 16:최유리(IOC) , 20:보통(FOK) , 23:시장가(FOK) , 26:최유리(FOK) , 28:스톱지정가,29:중간가,30:중간가(IOC),31:중간가(FOK)",
+     "element": "trde_tp",
+     "name": "매매구분",
+     "required": "Y"
+    },
+    {
+     "description": "단위: 원",
+     "element": "cond_uv",
+     "name": "조건단가",
+     "required": "N"
+    }
+   ],
+   "url": "/api/dostk/ordr"
+  },
+  "kt10001": {
+   "api_name": "주식 매도주문",
+   "menu_path": "국내주식 > 주문 > 주식 매도주문(kt10001)",
+   "request_body": [
+    {
+     "description": "KRX,NXT,SOR",
+     "element": "dmst_stex_tp",
+     "name": "국내거래소구분",
+     "required": "Y"
+    },
+    {
+     "description": "",
+     "element": "stk_cd",
+     "name": "종목코드",
+     "required": "Y"
+    },
+    {
+     "description": "단위: 1주",
+     "element": "ord_qty",
+     "name": "주문수량",
+     "required": "Y"
+    },
+    {
+     "description": "단위: 원",
+     "element": "ord_uv",
+     "name": "주문단가",
+     "required": "N"
+    },
+    {
+     "description": "0:보통 , 3:시장가 , 5:조건부지정가 , 81:장마감후시간외 , 61:장시작전시간외, 62:시간외단일가 , 6:최유리지정가 , 7:최우선지정가 , 10:보통(IOC) , 13:시장가(IOC) , 16:최유리(IOC) , 20:보통(FOK) , 23:시장가(FOK) , 26:최유리(FOK) , 28:스톱지정가,29:중간가,30:중간가(IOC),31:중간가(FOK)",
+     "element": "trde_tp",
+     "name": "매매구분",
+     "required": "Y"
+    },
+    {
+     "description": "단위: 원",
+     "element": "cond_uv",
+     "name": "조건단가",
+     "required": "N"
+    }
+   ],
+   "url": "/api/dostk/ordr"
+  },
+  "kt10002": {
+   "api_name": "주식 정정주문",
+   "menu_path": "국내주식 > 주문 > 주식 정정주문(kt10002)",
+   "request_body": [
+    {
+     "description": "KRX,NXT,SOR",
+     "element": "dmst_stex_tp",
+     "name": "국내거래소구분",
+     "required": "Y"
+    },
+    {
+     "description": "매수/매도 주문 요청 응답 결과로 받은 7자리 주문번호",
+     "element": "orig_ord_no",
+     "name": "원주문번호",
+     "required": "Y"
+    },
+    {
+     "description": "",
+     "element": "stk_cd",
+     "name": "종목코드",
+     "required": "Y"
+    },
+    {
+     "description": "단위: 1주, '0' 입력 시 잔량 전부 정정",
+     "element": "mdfy_qty",
+     "name": "정정수량",
+     "required": "Y"
+    },
+    {
+     "description": "단위: 원",
+     "element": "mdfy_uv",
+     "name": "정정단가",
+     "required": "Y"
+    },
+    {
+     "description": "단위: 원",
+     "element": "mdfy_cond_uv",
+     "name": "정정조건단가",
+     "required": "N"
+    }
+   ],
+   "url": "/api/dostk/ordr"
+  },
+  "kt10003": {
+   "api_name": "주식 취소주문",
+   "menu_path": "국내주식 > 주문 > 주식 취소주문(kt10003)",
+   "request_body": [
+    {
+     "description": "KRX,NXT,SOR",
+     "element": "dmst_stex_tp",
+     "name": "국내거래소구분",
+     "required": "Y"
+    },
+    {
+     "description": "매수/매도 주문 요청 응답 결과로 받은 7자리 주문번호",
+     "element": "orig_ord_no",
+     "name": "원주문번호",
+     "required": "Y"
+    },
+    {
+     "description": "",
+     "element": "stk_cd",
+     "name": "종목코드",
+     "required": "Y"
+    },
+    {
+     "description": "단위: 1주, '0' 입력시 잔량 전부 취소",
+     "element": "cncl_qty",
+     "name": "취소수량",
+     "required": "Y"
+    }
+   ],
+   "url": "/api/dostk/ordr"
+  }
+ }
+}

@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from datetime import datetime
+import time
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
 
-from ..constants import APIInfo, MARKET_DATA_APIS, RANKING_APIS, SECTOR_APIS
+from ..constants import APIInfo, CHART_APIS, MARKET_DATA_APIS, RANKING_APIS, SECTOR_APIS
 from .kiwoom_client import KiwoomClient
 
 KST = ZoneInfo("Asia/Seoul")
+_STOCK_DETAIL_CACHE: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
 
 
 def _normalize_return_code(value: Any) -> int | None:
@@ -107,6 +110,18 @@ def _build_exception_result(
     }
 
 
+def _rate_limit_delay(attempt: int, headers: httpx.Headers | dict[str, str] | None) -> float:
+    """Return a conservative retry delay for Kiwoom HTTP 429 responses."""
+
+    retry_after = (headers or {}).get("Retry-After")
+    if retry_after:
+        try:
+            return max(float(retry_after), 0.0)
+        except ValueError:
+            pass
+    return 0.75 * (attempt + 1)
+
+
 async def _post_market_query(
     client: KiwoomClient,
     *,
@@ -133,7 +148,7 @@ async def _post_market_query(
             except httpx.HTTPStatusError as error:
                 if error.response.status_code != 429 or attempt == 2:
                     raise
-                await asyncio.sleep(0.2 * (attempt + 1))
+                await asyncio.sleep(_rate_limit_delay(attempt, error.response.headers))
         if response is None:
             raise RuntimeError("No response returned from Kiwoom market query")
         response_data = response.json()
@@ -393,13 +408,157 @@ async def get_stock_daily_bars(
     return result
 
 
+async def get_stock_daily_chart(
+    client: KiwoomClient,
+    *,
+    stock_code: str,
+    base_date: str,
+    adjusted: bool = True,
+) -> dict[str, Any]:
+    """Get a long daily OHLCV chart (ka10081) for backtesting.
+
+    Returns ~600 bars (≈2.5y) ending at ``base_date`` in one call — far more
+    than ka10005's 30. Rows carry dt/open_pric/high_pric/low_pric/cur_prc
+    (close)/trde_qty/trde_prica. ``adjusted`` (upd_stkpc_tp=1) splits-adjusts.
+    """
+
+    return await _post_market_query(
+        client,
+        api_info=CHART_APIS["ka10081"],
+        request_data={
+            "stk_cd": stock_code,
+            "base_dt": base_date,
+            "upd_stkpc_tp": "1" if adjusted else "0",
+        },
+        context={"stock_code": stock_code, "base_date": base_date},
+        payload_key="daily_chart",
+        payload_extractor=_extract_list("stk_dt_pole_chart_qry"),
+        empty_payload=[],
+        exception_message="Stock daily-chart query failed",
+    )
+
+
+def index_bar_close(row: dict[str, Any]) -> float | None:
+    """Close of one ka20006 bar, rescaled to real index points.
+
+    The vendor sends index prices multiplied by 100 with the decimal point
+    dropped: KOSPI's 2026-09-18 close of 6894.23 arrives as ``"689423"``.
+    Reading the field raw gives a number 100x too large, which still looks
+    plausible on a chart and only shows up as a wrong return.
+    """
+
+    raw = row.get("cur_prc") if isinstance(row, dict) else None
+    value = _to_float_text(raw)
+    if value is None or value <= 0:
+        return None
+    return value / 100.0
+
+
+def _to_float_text(value: Any) -> float | None:
+    """Parse a Kiwoom numeric string, tolerating +/- signs and commas."""
+
+    if value in ("", None):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).replace(",", "").strip()
+    if not text:
+        return None
+    sign = 1.0
+    if text[0] == "+":
+        text = text[1:]
+    elif text[0] == "-":
+        sign = -1.0
+        text = text[1:]
+    try:
+        return sign * float(text)
+    except ValueError:
+        return None
+
+
+async def get_index_daily_bars(
+    client: KiwoomClient,
+    *,
+    inds_cd: str,
+    base_date: str,
+) -> dict[str, Any]:
+    """Get a long daily bar series for a market index (ka20006).
+
+    ~600 bars ending at ``base_date`` in one call, which covers any window
+    the benchmark comparison needs without pagination. ``inds_cd`` is the
+    index code: "001" KOSPI, "101" KOSDAQ.
+
+    ⚠️ Prices come back scaled by 100 with the decimal point dropped —
+    2026-09-18's KOSPI close of 6894.23 arrives as ``"689423"``. Use
+    `index_bar_close` rather than reading `cur_prc` directly.
+
+    ⚠️ `inds_cd` is required. Our own kiwoom_api_spec.md listed only
+    `base_dt` and the broker answers that with
+    `1511:필수입력 파라미터=inds_cd` — the same shape as the ka10075
+    `all_stk_tp` outage. Kiwoom's published spec has it right; the
+    hand-written table was the one missing it.
+    """
+
+    return await _post_market_query(
+        client,
+        api_info=CHART_APIS["ka20006"],
+        request_data={"inds_cd": inds_cd, "base_dt": base_date},
+        context={"inds_cd": inds_cd, "base_date": base_date},
+        payload_key="index_daily_bars",
+        payload_extractor=_extract_list("inds_dt_pole_qry"),
+        empty_payload=[],
+        exception_message="Index daily-bar query failed",
+    )
+
+
+async def get_investor_supply_chart(
+    client: KiwoomClient,
+    *,
+    stock_code: str,
+    base_date: str,
+) -> dict[str, Any]:
+    """Get the per-investor net-buy daily chart (ka10060) for one stock.
+
+    Rows (latest first) carry dt + frgnr_invsr(외국인)/orgn(기관)/penfnd_etc
+    (연기금=국민연금)/ind_invsr(개인) net-buy in 백만원 (amt_qty_tp=1).
+    ~100 days in one call — the Korean-market supply/demand signal. One call
+    per stock, so cache aggressively (API-budget concern).
+    """
+    return await _post_market_query(
+        client,
+        api_info=CHART_APIS["ka10060"],
+        request_data={
+            "stk_cd": stock_code,
+            "dt": base_date,
+            "amt_qty_tp": "1",   # 1=금액(백만원)
+            "trde_tp": "0",      # 0=순매수
+            "unit_tp": "1000",   # 천주
+        },
+        context={"stock_code": stock_code, "base_date": base_date},
+        payload_key="supply_chart",
+        payload_extractor=_extract_list("stk_invsr_orgn_chart"),
+        empty_payload=[],
+        exception_message="Investor supply chart query failed",
+    )
+
+
 async def get_stock_detail_bundle(
     client: KiwoomClient,
     *,
     stock_code: str,
     bar_limit: int = 5,
+    cache_ttl_seconds: float = 0.0,
 ) -> dict[str, Any]:
     """Get quote, orderbook, and recent daily bars for one stock."""
+
+    cache_key = (stock_code, bar_limit)
+    now = time.monotonic()
+    if cache_ttl_seconds > 0:
+        cached = _STOCK_DETAIL_CACHE.get(cache_key)
+        if cached and now - cached[0] <= cache_ttl_seconds:
+            result = copy.deepcopy(cached[1])
+            result["cache_hit"] = True
+            return result
 
     quote_result = await get_stock_quote(client, stock_code=stock_code)
     orderbook_result = await get_stock_orderbook(client, stock_code=stock_code)
@@ -417,7 +576,7 @@ async def get_stock_detail_bundle(
         ]
     )
 
-    return {
+    result = {
         "success": success,
         "stock_code": stock_code,
         "quote_result": quote_result,
@@ -427,6 +586,9 @@ async def get_stock_detail_bundle(
         "orderbook": orderbook_result.get("orderbook", {}),
         "daily_bars": daily_bars_result.get("daily_bars", []),
     }
+    if cache_ttl_seconds > 0 and success:
+        _STOCK_DETAIL_CACHE[cache_key] = (now, copy.deepcopy(result))
+    return result
 
 
 async def get_market_snapshot(
@@ -435,8 +597,17 @@ async def get_market_snapshot(
     watchlist: list[str] | None = None,
     leaders_limit: int = 10,
     sector_limit: int = 10,
+    stock_detail_cache_ttl_seconds: float = 0.0,
+    leaders_market_tp: str = "000",
 ) -> dict[str, Any]:
-    """Build an aggregated market snapshot suitable for hourly automation."""
+    """Build an aggregated market snapshot suitable for hourly automation.
+
+    ``leaders_market_tp`` scopes the leaderboard queries: "000" both markets
+    (default), "001" KOSPI only, "101" KOSDAQ only. KOSPI-only + a high
+    market-cap filter is the large-cap strategy (2026-06-24): the universe
+    then leans on 거래대금(value) leaders where 삼성/SK 등 대형주가 상위에
+    오른다 (등락률 상위는 대부분 소형주라 시총 필터에서 걸러짐).
+    """
 
     watchlist_codes = []
     for code in watchlist or []:
@@ -446,14 +617,18 @@ async def get_market_snapshot(
     kospi_result = await get_index_snapshot(client, inds_cd="001", mrkt_tp="000")
     kosdaq_result = await get_index_snapshot(client, inds_cd="101", mrkt_tp="101")
     sector_result = await get_sector_overview(client, inds_cd="001", limit=sector_limit)
-    gainers_result = await get_top_gainers(client, mrkt_tp="000", limit=leaders_limit)
-    volume_result = await get_top_volume_leaders(client, mrkt_tp="000", limit=leaders_limit)
-    value_result = await get_top_value_leaders(client, mrkt_tp="000", limit=leaders_limit)
+    gainers_result = await get_top_gainers(client, mrkt_tp=leaders_market_tp, limit=leaders_limit)
+    volume_result = await get_top_volume_leaders(client, mrkt_tp=leaders_market_tp, limit=leaders_limit)
+    value_result = await get_top_value_leaders(client, mrkt_tp=leaders_market_tp, limit=leaders_limit)
 
     watchlist_details = []
     for stock_code in watchlist_codes:
         watchlist_details.append(
-            await get_stock_detail_bundle(client, stock_code=stock_code)
+            await get_stock_detail_bundle(
+                client,
+                stock_code=stock_code,
+                cache_ttl_seconds=stock_detail_cache_ttl_seconds,
+            )
         )
 
     success = all(

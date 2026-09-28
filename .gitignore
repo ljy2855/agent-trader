@@ -11,3 +11,49 @@ wheels/
 
 
 .env
+output/
+
+# Strategy state files — runtime carryover, not source
+automation/eligible_carryover_*.json
+
+# Secrets — injected via k8s secret / host file, never commit
+automation/discord_webhook_url
+
+# Local tooling / editor state
+.claude/
+.playwright-cli/
+.DS_Store
+
+# Vendor API reference PDFs (large, redistributed docs — keep local only)
+*.pdf
+
+# Backtest daily-bar cache — regenerate with `backtest.run fetch` (in-cluster)
+backtest/cache/
+
+# Operational cycle logs — append-only host-side journals, not source.
+# Tens of thousands of lines and rewritten every session; keeping them out
+# of history avoids swamping diffs.
+automation/memory.md
+automation/memory_live.md
+automation/memory_mock.md
+
+# docs/site 빌드 산출물 (docs/site/build.sh)
+docs/site/.build/
+
+# ---------------------------------------------------------------------------
+# Personal infrastructure — kept on the author's disk, never published.
+# The public repository carries the code. Deployment manifests, host setup,
+# operator notes and runbooks for the author's own environment stay local.
+# CLAUDE.md is listed on purpose: Claude Code reads it from disk whether or
+# not git tracks it. Use automation/trading_env.example.sh as the template for
+# automation/trading_env.sh.
+# ---------------------------------------------------------------------------
+/CLAUDE.md
+/docs/ops/
+/docs/site/
+/k8s/
+/Dockerfile.safety
+/Dockerfile.safety.dockerignore
+/automation/trading_env.sh
+/automation/prepare_kiwoom_ledger_volume.sh
+/automation/market-hours-caffeinate.sh
