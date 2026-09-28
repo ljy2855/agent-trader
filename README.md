@@ -4,7 +4,8 @@
 
 종목 투자 여부는 LLM agent가 판단하고, 실제 매매 로직은 코드로 구현
 
-![](./assets/orca-paste-1790565726086-c39269a0-6897-496d-a5e9-4f6e43f1a447.png)
+<img width="1330" height="1066" alt="image" src="https://github.com/user-attachments/assets/49489e8f-d0b6-42f4-9297-c5f83a4df0fd" />
+
 
 - **MCP server**: Claude 같은 MCP client에 키움 계좌·시세 조회 도구를 제공. 잔고, 체결, 미체결, 현재가, 일봉, 시장 스냅샷을 조회
 - **Watcher**: 계좌 하나를 장중 내내 지켜보는 루프. 손절, 익절, 오래된 미체결 취소는 코드가 바로 처리. 종목 매매 판단은 [Multica](https://github.com/multica-ai/multica)를 거쳐 LLM agent 콜백
