@@ -606,3 +606,30 @@ def test_an_unreadable_time_is_skipped_but_logged(caplog):
 
     assert out == []
     assert any("no readable order time" in r.message for r in caplog.records)
+
+
+def test_candidate_snapshot_carries_how_much_of_the_move_was_its_own():
+    """The screener is asked whether a dip is temporary; these fields answer part of it."""
+
+    row = {
+        "stock_code": "005930",
+        "stock_name": "삼성전자",
+        "eligible": True,
+        "score": 9,
+        "market_change_pct": -2.0,
+        "excess_vs_market_pct": 0.5,
+        "return_5d_pct": -3.0,
+        "peer_return_5d_pct": -1.0,
+        "excess_5d_vs_peers_pct": -2.0,
+    }
+
+    (event,) = detect_tier2_new_candidates([row], set(), min_score=8, available_slots=1)
+
+    for key in (
+        "market_change_pct",
+        "excess_vs_market_pct",
+        "return_5d_pct",
+        "peer_return_5d_pct",
+        "excess_5d_vs_peers_pct",
+    ):
+        assert event.snapshot[key] == row[key], key

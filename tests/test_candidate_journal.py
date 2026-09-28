@@ -181,3 +181,13 @@ def test_unwritable_path_is_swallowed(tmp_path):
     j = CandidateJournal(blocker / "scores.jsonl")
     assert j.record(now=T0, regime={}, candidate_rows=[_row("A", 7, 2.0)],
                     min_score=8) is None
+
+
+def test_band_records_the_move_against_the_peers():
+    """Kept so the backtest's 'dips taken alone keep lagging' can be re-measured live."""
+
+    row = {**_row("A", 8, 2.0), "excess_5d_vs_peers_pct": -2.3}
+
+    rec = build_record(now=T0, regime={}, candidate_rows=[row], min_score=8)
+
+    assert rec["band"][0]["excess_5d_pct"] == -2.3

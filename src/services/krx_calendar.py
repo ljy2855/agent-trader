@@ -234,6 +234,30 @@ def is_krx_regular_session_open(now: datetime | None = None) -> bool:
     return krx_regular_session_status(now).is_open
 
 
+# KRX runs the last ten minutes of the regular session as a single-price call
+# auction (장 마감 동시호가): orders accumulate and all of them fill at one
+# closing price when it ends. A special session moves the close, not the
+# length of the auction.
+CLOSING_AUCTION_MINUTES = 10
+
+
+def session_close_datetime(status: KrxSessionStatus) -> datetime | None:
+    """The observed day's regular-session close in KST, or None without one."""
+
+    if status.closes_at is None:
+        return None
+    return datetime.combine(status.observed_at.date(), status.closes_at, tzinfo=KST)
+
+
+def closing_auction_start(status: KrxSessionStatus) -> datetime | None:
+    """When the observed day's closing call auction begins, or None."""
+
+    close = session_close_datetime(status)
+    if close is None:
+        return None
+    return close - timedelta(minutes=CLOSING_AUCTION_MINUTES)
+
+
 def next_regular_session_open(
     now: datetime | None = None, *, horizon_days: int = 14
 ) -> tuple[datetime, bool] | None:
@@ -264,6 +288,7 @@ def next_regular_session_open(
 
 
 __all__ = [
+    "CLOSING_AUCTION_MINUTES",
     "DAY_CLOSED",
     "DAY_TRADING",
     "DAY_UNCERTAIN",
@@ -277,10 +302,12 @@ __all__ = [
     "SESSION_OPEN",
     "SESSION_UNCERTAIN",
     "SUPPORTED_KRX_CALENDAR_YEARS",
+    "closing_auction_start",
     "is_krx_regular_session_open",
     "is_krx_trading_day",
     "krx_day_status",
     "krx_regular_session_status",
     "market_holiday_name",
     "next_regular_session_open",
+    "session_close_datetime",
 ]

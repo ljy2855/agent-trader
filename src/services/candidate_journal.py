@@ -97,6 +97,11 @@ def build_record(
                 "name": row.get("stock_name"),
                 "score": row.get("score"),
                 "dip_pct": row.get("ma_dip_pct"),
+                # The 5-session return against the scanned peers. Recorded so
+                # the backtest finding — dips taken alone keep lagging, dips
+                # shared with the market recover — can be re-measured on live
+                # scans instead of trusted from one sample.
+                "excess_5d_pct": row.get("excess_5d_vs_peers_pct"),
                 "eligible": bool(row.get("eligible")),
                 "blocked_by": [
                     reason for reason in (row.get("reasons") or [])

@@ -56,13 +56,17 @@ from .daily_risk import (
 )
 from ..constants.universe import UNIVERSE_LEADERS
 from .candidate_journal import CandidateJournal, in_band as journal_in_band
+from .entry_rules import is_shallow_dip
 from .krx_calendar import (
     SESSION_CLOSED,
     SESSION_UNCERTAIN,
     KrxSessionStatus,
+    closing_auction_start,
     is_krx_regular_session_open,
     krx_regular_session_status,
+    session_close_datetime,
 )
+from .krx_ticks import floor_to_stock_tick
 from .multica_dispatch import MulticaDispatcher, extract_action_tag
 from . import order_ledger
 from .order_ledger import (
@@ -85,6 +89,7 @@ from .strategy import (
     _normalize_holding_rows,
     _safe_budget_amount,
     _score_candidate,
+    moving_average,
     plan_intraday_momentum_strategy,
     to_price,
 )
@@ -111,6 +116,40 @@ DEFAULT_CANDIDATE_JOURNAL_PATH = (
 )
 
 log = logging.getLogger("kiwoom.watcher")
+
+
+# ---------------------------------------------------------------------------
+# Entry execution
+# ---------------------------------------------------------------------------
+
+# How an approved candidate becomes an order.
+#   immediate     — buy the moment the screener approves, at the best ask.
+#                   Every entry pays half the spread.
+#   close_auction — screen only in the last `close_auction_screen_minutes`
+#                   of the session, hold the approval, and submit it into the
+#                   closing call auction (장 마감 동시호가). Every order in the
+#                   auction fills at one price, so the entry pays no spread,
+#                   and a signal defined on the daily close is traded at the
+#                   close it is defined on.
+ENTRY_EXECUTION_IMMEDIATE = "immediate"
+ENTRY_EXECUTION_CLOSE_AUCTION = "close_auction"
+ENTRY_EXECUTION_MODES = (ENTRY_EXECUTION_IMMEDIATE, ENTRY_EXECUTION_CLOSE_AUCTION)
+
+# Held approvals go into the auction until this long before the close. KRX
+# randomises the auction's end by up to 30 seconds, and a 30-second poll needs
+# slack on top of that.
+CLOSE_AUCTION_SUBMIT_CUTOFF = timedelta(minutes=2)
+# After the close, a session's unresolved intents keep being reconciled for
+# this long. The auction fills at the close, which is exactly when the loop
+# would otherwise go to sleep — and the execution query only returns today's
+# fills, so a fill missed today can never settle its intent tomorrow.
+POST_CLOSE_RECONCILE_WINDOW = timedelta(minutes=20)
+
+# Where the session stands for close-auction entries.
+AUCTION_PHASE_WAIT = "wait"      # before screening opens: no candidate dispatch
+AUCTION_PHASE_SCREEN = "screen"  # dispatch candidates, hold approvals
+AUCTION_PHASE_SUBMIT = "submit"  # the auction is running: submit held approvals
+AUCTION_PHASE_CLOSED = "closed"  # too late to submit, or no regular session
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +335,11 @@ class WatcherConfig:
     # works without it, so this is an accelerator that has to earn its place
     # in a live session before it becomes the default.
     enable_realtime_orders: bool = False
+    # How approved candidates are bought — see ENTRY_EXECUTION_MODES. With
+    # close_auction, candidates are only sent to the screener from this many
+    # minutes before the close until the auction starts.
+    entry_execution: str = ENTRY_EXECUTION_IMMEDIATE
+    close_auction_screen_minutes: int = 40
     watchlist: list[str] = field(default_factory=list)
 
     # Daily new-entry circuit breaker. All three default to 0 = disabled so
@@ -344,6 +388,31 @@ class InFlightTask:
     started_at: datetime
     issue_id: str
     task: asyncio.Task[Any]
+
+
+@dataclass(slots=True)
+class CloseAuctionEntry:
+    """An approved candidate waiting for the closing auction.
+
+    In memory only: a restart forgets it and nothing is bought, which is the
+    safe direction to fail. ``trigger`` carries the snapshot validated at
+    approval time; the submit path prices its stale check off that snapshot.
+    """
+
+    trigger: TriggerEvent
+    action: str
+    held_at: datetime
+    trading_day: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "stock_code": self.trigger.stock_code,
+            "stock_name": self.trigger.stock_name,
+            "action": self.action,
+            "held_at": self.held_at.isoformat(),
+            "reference_price": self.trigger.snapshot.get("current_price"),
+            "trading_day": self.trading_day,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +581,12 @@ class IntradayWatcher:
         # to be an in-memory dict with a TTL, which a restart erased; it now
         # comes from the durable order ledger (`_ledger.unresolved_*`).
         self._in_flight: dict[str, InFlightTask] = {}
+        # entry_execution=close_auction: approvals waiting for the auction,
+        # keyed by normalized code, and the (trading_day, order_no) of what
+        # this process submitted into it — those are expected to sit unfilled
+        # until the close, so the stale-order cancel must leave them alone.
+        self._close_auction_entries: dict[str, CloseAuctionEntry] = {}
+        self._close_auction_orders: set[tuple[str, str]] = set()
         self._last_known_run_id: dict[str, str] = {}  # issue_id -> run_id
         self._trigger_log: dict[str, TriggerLogEntry] = {}  # scope_key -> log entry
         self._cycle_count = 0
@@ -564,6 +639,11 @@ class IntradayWatcher:
             while not self._stop_event.is_set():
                 session = self._market_session_status()
                 if session.state == SESSION_CLOSED:
+                    if await self._post_close_reconcile(session):
+                        await self._sleep_with_stop(
+                            self._config.poll_interval_seconds
+                        )
+                        continue
                     await self._sleep_with_stop(
                         self._config.off_hours_interval_seconds
                     )
@@ -747,14 +827,35 @@ class IntradayWatcher:
         regime = result.get("regime", {}) or {}
         candidate_rows = result.get("candidate_rows", []) or []
 
+        # A held close-auction approval already owns a slot: it will be
+        # bought at the close, and screening another name for the same slot
+        # only spends an agent call on a buy the gates will refuse.
+        auction_phase = self._close_auction_phase()
+        reserved = 0
+        if auction_phase is not None:
+            await self._expire_close_auction_entries(auction_phase)
+            held_codes = {
+                order_ledger.normalize_stock_code(h.get("stock_code"))
+                for h in holdings
+            }
+            reserved = sum(
+                1 for code in self._close_auction_entries if code not in held_codes
+            )
+
         # The first gate a candidate meets, computed once here and handed
         # to both the journal and the detector below. Two copies of this
         # arithmetic would be free to drift, which is how the stale-cancel
         # parser went three months without firing.
         available_slots = min(
-            max(self._config.max_positions - len(holdings), 0),
+            max(self._config.max_positions - len(holdings) - reserved, 0),
             self._config.max_new_positions,
         )
+        # Outside the screening window the screener is not asked at all. That
+        # is a schedule, not a full portfolio, so the journal and the slot
+        # metrics keep reporting `available_slots`.
+        dispatch_slots = available_slots
+        if auction_phase is not None and auction_phase != AUCTION_PHASE_SCREEN:
+            dispatch_slots = 0
 
         # Record what the scorer saw before any gate consumes it. Only a
         # dispatch survives otherwise, and a dispatch by definition already
@@ -897,9 +998,15 @@ class IntradayWatcher:
             events += triggers.detect_tier1_position_overflow(
                 holdings, max_positions=self._config.max_positions
             )
-        events += triggers.detect_tier1_stale_orders(
-            open_orders, stale_minutes=self._config.stale_unfilled_minutes
-        )
+        events += [
+            event
+            for event in triggers.detect_tier1_stale_orders(
+                open_orders, stale_minutes=self._config.stale_unfilled_minutes
+            )
+            # Our closing-auction buy rests unfilled until the close by
+            # design; cancelling it five minutes in would undo the entry.
+            if not self._is_close_auction_order(event)
+        ]
         events += triggers.detect_tier2_holding_swings(
             holdings,
             self._prev_holdings,
@@ -910,7 +1017,7 @@ class IntradayWatcher:
             candidate_rows,
             self._prev_qualified_codes,
             min_score=self._config.new_candidate_min_score,
-            available_slots=available_slots,
+            available_slots=dispatch_slots,
         )
         # Regime debounce: only emit regime_flip when the new label has
         # been stable across N consecutive ticks. This stops borderline
@@ -950,6 +1057,11 @@ class IntradayWatcher:
         for event in events:
             await self._handle_trigger(event, planner_result=result)
 
+        # After the tick's own triggers, so a protective exit is always sent
+        # before a new entry.
+        if auction_phase == AUCTION_PHASE_SUBMIT and self._close_auction_entries:
+            await self._submit_close_auction_entries(result)
+
         self._prev_holdings = {h["stock_code"]: h for h in holdings if h.get("stock_code")}
         self._prev_regime = regime
         # Track what qualified, not what was scanned. Under the movers
@@ -968,6 +1080,12 @@ class IntradayWatcher:
             and row.get("eligible")
             and (row.get("score") or 0) >= self._config.new_candidate_min_score
         }
+        if auction_phase is not None and auction_phase != AUCTION_PHASE_SCREEN:
+            # Nothing is dispatched outside the screening window, so nothing
+            # seen there may count as already seen: a name that sat in the band
+            # all morning has to read as new when the window opens, or it is
+            # never screened at all.
+            self._prev_qualified_codes = set()
 
         self._purge_expired_cooldowns()
         self._status.mark_tick(
@@ -2388,6 +2506,41 @@ class IntradayWatcher:
                     f"**가능한 ACTION**: `{action_options}` "
                     "— 이 트리거는 신규 후보 판정이며 매도 계열 ACTION은 해당 없음.\n\n"
                 )
+                # The skill still says "ACTION은 곧 즉시 매수". Under
+                # close_auction that is no longer what happens, and the agent
+                # should judge the buy it is actually approving.
+                if self._config.entry_execution == ENTRY_EXECUTION_CLOSE_AUCTION:
+                    status = self._market_session_status()
+                    start = closing_auction_start(status)
+                    close = session_close_datetime(status)
+                    window = (
+                        f"{start:%H:%M}~{close:%H:%M}"
+                        if start and close
+                        else "장 마감 동시호가"
+                    )
+                    portfolio_block += (
+                        "⏱ **즉시 매수가 아니다.** TIER1/TIER2는 장 마감 동시호가"
+                        f"({window})에 종가 단일가로 매수된다. 판단 기준은 "
+                        "'오늘 종가에 사도 되는가'다. 그 사이 가격이 "
+                        f"{self._config.stale_price_delta_pct}% 넘게 움직이거나 "
+                        "진입 조건을 벗어나면 코드가 취소한다.\n\n"
+                    )
+                # The skill asks whether a dip is temporary or the baseline
+                # moved, and gives the agent nothing to answer it with. These
+                # fields are the part of that question the data could answer.
+                if (
+                    event.snapshot.get("excess_5d_vs_peers_pct") is not None
+                    or event.snapshot.get("excess_vs_market_pct") is not None
+                ):
+                    portfolio_block += (
+                        "📉 **하락의 성격**: `excess_vs_market_pct` = 오늘 종목 등락률 − "
+                        "지수, `excess_5d_vs_peers_pct` = 최근 5세션 종목 수익률 − "
+                        "스캔한 대형주 평균. 크게 음수일수록 시장과 따로 혼자 빠진 것이다. "
+                        "2024-04~2026-09 로스터에서 MA20 눌림 중 5세션 동안 평균보다 "
+                        "1.5%p 넘게 더 빠진 경우, 이후 5~10세션 성과가 시장과 같이 빠진 "
+                        "눌림보다 0.5~1.1%p 나빴다(10세션만 우연 수준을 넘은 참고치). "
+                        "같은 기간 DART 공시(실적·사건) 유무는 차이를 만들지 못했다.\n\n"
+                    )
 
         return (
             f"{header}\n\n"
@@ -2950,8 +3103,21 @@ class IntradayWatcher:
                 action, "매수 매핑 없는 ACTION — 주문 없음"
             )
 
-        async with self._buy_lock:
-            return await self._submit_candidate_buy(event, action, planner_result)
+        phase = self._close_auction_phase()
+        if phase is None:
+            async with self._buy_lock:
+                return await self._submit_candidate_buy(event, action, planner_result)
+        if phase in (AUCTION_PHASE_WAIT, AUCTION_PHASE_SCREEN):
+            return await self._hold_for_close_auction(event, action, planner_result)
+        if phase == AUCTION_PHASE_SUBMIT:
+            # The auction is already running — nothing to wait for.
+            async with self._buy_lock:
+                return await self._submit_candidate_buy(
+                    event, action, planner_result, close_auction=True
+                )
+        return OrderApplyResult.skipped(
+            action, "종가 동시호가 제출 마감 — 신규 매수 생략"
+        )
 
     async def _refresh_entry_portfolio(
         self, planner_result: dict[str, Any]
@@ -3009,8 +3175,17 @@ class IntradayWatcher:
         event: TriggerEvent,
         action: str,
         planner_result: dict[str, Any],
+        *,
+        close_auction: bool = False,
     ) -> OrderApplyResult:
-        """Check and submit one entry while holding the account-wide buy lock."""
+        """Check and submit one entry while holding the account-wide buy lock.
+
+        ``close_auction`` swaps the last recheck and the order price: the
+        signal is rechecked without the order book (see
+        `_refresh_close_auction_candidate`), and the order is a limit capped
+        at the stale-price bound, which fills at the single auction price.
+        Every other gate is the same.
+        """
 
         if not self._config.new_entries_enabled:
             return OrderApplyResult.skipped(action, "신규 매수 중지 모드 — 보호매도/취소만 허용")
@@ -3078,7 +3253,12 @@ class IntradayWatcher:
             detail = self._record_failure(FAILURE_ACCOUNT, exc)
             return OrderApplyResult.skipped(action, f"최신 잔고 확인 불가: {detail}")
         try:
-            event = await self._refresh_entry_candidate(event, planner_result)
+            if close_auction:
+                event = await self._refresh_close_auction_candidate(
+                    event, planner_result
+                )
+            else:
+                event = await self._refresh_entry_candidate(event, planner_result)
         except Exception as exc:
             detail = self._record_failure(FAILURE_MARKET, exc)
             return OrderApplyResult.skipped(action, f"매수 조건 재검증 실패: {detail}")
@@ -3098,6 +3278,17 @@ class IntradayWatcher:
             return OrderApplyResult.skipped(action, "진입가 파싱 불가")
         if entry_int <= 0:
             return OrderApplyResult.skipped(action, "진입가 ≤ 0")
+        # The price the order carries. An immediate entry sends the best ask
+        # it was sized at. A closing-auction entry is sized at the reference
+        # price but carries a higher cap, and fills at the one auction price.
+        order_price = entry_int
+        if close_auction:
+            try:
+                order_price = int(snapshot["order_limit_price"])
+            except (KeyError, TypeError, ValueError):
+                return OrderApplyResult.skipped(action, "동시호가 상한가 산출 불가")
+            if order_price < entry_int:
+                return OrderApplyResult.skipped(action, "동시호가 상한가가 기준가보다 낮음")
 
         budget = (planner_result.get("portfolio") or {}).get("position_budget") or 0
         try:
@@ -3202,7 +3393,9 @@ class IntradayWatcher:
                 stock_code=code,
                 side=order_ledger.SIDE_BUY,
                 quantity=quantity,
-                price=entry_int,
+                # What the order will carry, so a broker row without our
+                # order number can still be matched on price.
+                price=order_price,
                 origin=event.trigger_type,
                 decision_scope=action,
             )
@@ -3236,15 +3429,29 @@ class IntradayWatcher:
                     reason="not submitted: daily entry reservation could not be persisted",
                 )
                 return OrderApplyResult.skipped(action, "일일 진입 예약 저장 실패 — 주문 미전송")
+        if close_auction:
+            ord_uv = str(order_price)
+        else:
+            ord_uv = str(entry_price) if entry_price else ""
         order_result = await order_service.place_stock_buy_order(
             self._client,
             stk_cd=event.stock_code or "",
             ord_qty=str(quantity),
             order_type_code=str(order_type_code),
-            ord_uv=str(entry_price) if entry_price else "",
+            ord_uv=ord_uv,
         )
         result = OrderApplyResult.from_order_response(action, order_result)
         self._settle_intent(intent, result)
+        auction_order_no = (
+            order_ledger.normalize_order_no(result.order_no) if close_auction else None
+        )
+        if auction_order_no:
+            self._close_auction_orders.add(
+                (
+                    self._market_session_status().observed_at.date().isoformat(),
+                    auction_order_no,
+                )
+            )
         # `submitted` for sure, and `unknown` too — a lost response might still
         # have booked the order, and treating it as nothing is how the same
         # stock gets bought twice. A `failed` order releases its slot: a
@@ -3303,6 +3510,294 @@ class IntradayWatcher:
         code = order_ledger.normalize_stock_code(event.stock_code)
         observed_at = self._protective_trigger_at.get(code)
         return observed_at is not None and observed_at >= event.detected_at
+
+    # -- closing-auction entries ---------------------------------------------
+
+    def _close_auction_phase(self) -> str | None:
+        """Where the session stands for closing-auction entries.
+
+        None when entries are immediate, so a caller keeps its immediate path
+        untouched by testing for None. An uncertain or closed session reads
+        as CLOSED: nothing is screened, held or submitted.
+        """
+
+        if self._config.entry_execution != ENTRY_EXECUTION_CLOSE_AUCTION:
+            return None
+        status = self._market_session_status()
+        close = session_close_datetime(status)
+        start = closing_auction_start(status)
+        if not status.is_open or close is None or start is None:
+            return AUCTION_PHASE_CLOSED
+        now = status.observed_at
+        if now >= close - CLOSE_AUCTION_SUBMIT_CUTOFF:
+            return AUCTION_PHASE_CLOSED
+        if now >= start:
+            return AUCTION_PHASE_SUBMIT
+        screen_from = close - timedelta(
+            minutes=self._config.close_auction_screen_minutes
+        )
+        if now >= screen_from:
+            return AUCTION_PHASE_SCREEN
+        return AUCTION_PHASE_WAIT
+
+    async def _hold_for_close_auction(
+        self,
+        event: TriggerEvent,
+        action: str,
+        planner_result: dict[str, Any],
+    ) -> OrderApplyResult:
+        """Validate an approval now and keep it for the closing auction.
+
+        The full recheck — order book included — runs here, while the book is
+        still a continuous one. The auction-time recheck then only has to ask
+        whether the price has moved or left the signal since.
+        """
+
+        if not self._config.new_entries_enabled:
+            return OrderApplyResult.skipped(action, "신규 매수 중지 모드 — 보호매도/취소만 허용")
+        entry_decision = self._breaker.check_new_entry()
+        if not entry_decision.allowed:
+            return OrderApplyResult.skipped(
+                action, entry_decision.reason or "일일 서킷브레이커"
+            )
+        try:
+            event = await self._refresh_entry_candidate(event, planner_result)
+        except Exception as exc:
+            detail = self._record_failure(FAILURE_MARKET, exc)
+            return OrderApplyResult.skipped(action, f"매수 조건 재검증 실패: {detail}")
+
+        status = self._market_session_status()
+        code = order_ledger.normalize_stock_code(event.stock_code)
+        self._close_auction_entries[code] = CloseAuctionEntry(
+            trigger=event,
+            action=action,
+            held_at=status.observed_at,
+            trading_day=status.observed_at.date().isoformat(),
+        )
+        self._publish_close_auction_entries()
+        start = closing_auction_start(status)
+        log.info(
+            "close-auction entry held: %s %s ref=%s",
+            code,
+            action,
+            event.snapshot.get("current_price"),
+        )
+        reason = "종가 동시호가 매수 예약"
+        if start is not None:
+            reason += (
+                f" — {start:%H:%M}부터 제출, 그 사이 가격이 "
+                f"{self._config.stale_price_delta_pct}% 넘게 움직이거나 "
+                "진입 조건을 벗어나면 취소"
+            )
+        return OrderApplyResult.informational(action, reason)
+
+    async def _refresh_close_auction_candidate(
+        self, event: TriggerEvent, planner_result: dict[str, Any]
+    ) -> TriggerEvent:
+        """Recheck a held approval inside the closing auction.
+
+        `_refresh_entry_candidate` rescores against the order book, and during
+        the call auction that book is an accumulation of unmatched orders —
+        bids can sit above asks until it clears — so it would refuse or
+        misscore every entry. What decides this entry is price-based: the move
+        since approval (the stale bound), the regime veto, and for below_ma
+        the MA band on the latest price.
+
+        The order is a limit capped at that same stale bound. The auction
+        fills every order at one price, so the cap costs nothing when the
+        close is normal and refuses a close that spiked past what was approved.
+        """
+
+        valid, detail = await self._is_still_valid(event)
+        if not valid or detail is None or detail.get("success") is False:
+            raise ValueError("시세 누락 또는 승인 이후 가격 변동 초과")
+        if self._api_failure_count > 0:
+            raise ValueError("최근 감시 사이클의 데이터 조회 실패 — 신규 진입 보류")
+        regime = self._prev_regime or planner_result.get("regime") or {}
+        if not regime or not regime.get("market_data_complete", True):
+            raise ValueError("현재 시장 레짐 확인 불가")
+        if regime.get("extreme_risk_off"):
+            raise ValueError("극단적 시장 약세 — 신규 진입 불가")
+        quote = detail.get("quote") or {}
+        price = to_price(quote.get("cur_prc"))
+        if not price:
+            raise ValueError("현재가 확인 불가")
+        if self._config.entry_mode == "below_ma":
+            average = moving_average(
+                detail.get("daily_bars") or [], self._config.ma_period
+            )
+            if average is None or not is_shallow_dip(price, average):
+                raise ValueError(
+                    f"MA{self._config.ma_period} 진입 밴드 이탈 (현재가 {price:,})"
+                )
+        cap = floor_to_stock_tick(
+            price * (1 + self._config.stale_price_delta_pct / 100)
+        )
+        upper_limit = to_price(quote.get("upl_pric"))
+        if upper_limit:
+            cap = min(cap, upper_limit)
+        # `price` is a traded price and therefore a valid tick.
+        cap = max(cap, price)
+        return replace(
+            event,
+            snapshot={
+                **event.snapshot,
+                "current_price": price,
+                "entry_price": str(price),
+                "entry_order_type_code": "0",
+                "order_limit_price": cap,
+            },
+        )
+
+    async def _submit_close_auction_entries(
+        self, planner_result: dict[str, Any]
+    ) -> None:
+        """Send every held approval into the running closing auction.
+
+        One attempt each: whatever the gates say now is final for the day. A
+        transient failure costs one day's entry, never a stray order.
+        """
+
+        for code, entry in list(self._close_auction_entries.items()):
+            self._close_auction_entries.pop(code, None)
+            event, action = entry.trigger, entry.action
+            target = f"{event.stock_name or code} ({code})"
+            try:
+                if not self._can_execute_orders():
+                    result = OrderApplyResult.skipped(action, "execute_orders=False")
+                elif self._superseded_by_protective_trigger(event):
+                    result = OrderApplyResult.skipped(
+                        action, "보호주문 발생 이후 오래된 agent 매수 폐기"
+                    )
+                else:
+                    async with self._buy_lock:
+                        result = await self._submit_candidate_buy(
+                            event, action, planner_result, close_auction=True
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one entry must not end the tick
+                detail = self._record_failure(FAILURE_ORDER, exc)
+                log.exception("close-auction submit failed: %s", code)
+                await self._safe_notify_error(
+                    "종가 동시호가 매수 실패", f"{target} — {detail}"
+                )
+                continue
+            log.info(
+                "close-auction entry %s: %s %s — %s",
+                result.state,
+                code,
+                action,
+                result.reason,
+            )
+            await self._notify_close_auction_result(target, action, result)
+        self._publish_close_auction_entries()
+
+    async def _notify_close_auction_result(
+        self, target: str, action: str, result: OrderApplyResult
+    ) -> None:
+        if result.state == ORDER_STATE_SUBMITTED:
+            order_line = f" · 주문번호 {result.order_no}" if result.order_no else ""
+            await self._notifier.success(
+                f"종가 동시호가 매수 접수 · {action}",
+                f"{target} — 체결가는 장 마감 단일가로 정해진다{order_line}",
+            )
+        elif result.state == ORDER_STATE_UNKNOWN:
+            await self._notifier.error(
+                "종가 동시호가 매수 접수 불명",
+                f"{target} — {result.reason or '응답 유실'}\n"
+                "브로커 접수 여부 미확인 — 재주문 금지, 미체결/체결 조회로 확인 필요",
+            )
+        elif result.state == ORDER_STATE_FAILED:
+            await self._notifier.error(
+                "종가 동시호가 매수 거부",
+                f"{target} — {result.reason or '사유 미상'}",
+            )
+        else:
+            await self._notifier.warn(
+                "종가 동시호가 매수 취소",
+                f"{target} — {result.reason or result.state}",
+            )
+
+    async def _expire_close_auction_entries(self, phase: str) -> None:
+        """Drop held approvals that can no longer reach an auction.
+
+        Normally the first tick of the auction submits them; one still held
+        once submission has closed means that tick never came, which is worth
+        a warning rather than a silent miss.
+        """
+
+        if not self._close_auction_entries and not self._close_auction_orders:
+            return
+        today = self._market_session_status().observed_at.date().isoformat()
+        self._close_auction_orders = {
+            key for key in self._close_auction_orders if key[0] == today
+        }
+        expired = [
+            code
+            for code, entry in self._close_auction_entries.items()
+            if phase == AUCTION_PHASE_CLOSED or entry.trading_day != today
+        ]
+        for code in expired:
+            entry = self._close_auction_entries.pop(code)
+            log.warning(
+                "close-auction entry expired unsubmitted: %s %s (held %s)",
+                code,
+                entry.action,
+                entry.held_at.isoformat(),
+            )
+            await self._notifier.warn(
+                "종가 동시호가 매수 미제출",
+                f"{entry.trigger.stock_name or code} ({code}) {entry.action} — "
+                "제출 시간을 넘겨 예약을 폐기했다",
+            )
+        if expired:
+            self._publish_close_auction_entries()
+
+    def _is_close_auction_order(self, event: TriggerEvent) -> bool:
+        """Is this stale-order trigger about our own closing-auction buy?"""
+
+        if not self._close_auction_orders or event.trigger_type != "stale_unfilled_order":
+            return False
+        order_no = order_ledger.normalize_order_no(event.metadata.get("order_no"))
+        today = self._market_session_status().observed_at.date().isoformat()
+        return order_no is not None and (today, order_no) in self._close_auction_orders
+
+    def _publish_close_auction_entries(self) -> None:
+        self._status.set_close_auction_entries(
+            [entry.to_dict() for entry in self._close_auction_entries.values()]
+        )
+
+    async def _post_close_reconcile(self, session: KrxSessionStatus) -> bool:
+        """Settle today's orders in the minutes after the close.
+
+        A closing-auction buy fills at the close — the moment the loop would
+        otherwise sleep until tomorrow. The realtime stream usually settles
+        it, but the polled views are the authority, and the execution query
+        only covers today: a fill not reconciled before the day ends leaves
+        its intent unresolved, and that code blocked, until settled by hand.
+
+        Returns True when it ran, so the loop keeps polling at the short
+        interval until nothing is pending or the window passes.
+        """
+
+        if self._config.entry_execution != ENTRY_EXECUTION_CLOSE_AUCTION:
+            return False
+        close = session_close_datetime(session)
+        if close is None:
+            return False
+        if not close < session.observed_at <= close + POST_CLOSE_RECONCILE_WINDOW:
+            return False
+        if not self._has_unresolved_intents():
+            return False
+        try:
+            await self._reconcile_ledger(fetch_open_orders=True, fetch_executions=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the loop must survive this
+            detail = self._record_failure(FAILURE_ACCOUNT, exc)
+            log.warning("post-close reconciliation failed: %s", detail)
+        return True
 
     # -- state lifecycle -----------------------------------------------------
 

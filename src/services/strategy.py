@@ -672,6 +672,41 @@ def limit_distance_pct(price: int | None, limit: int | None) -> float | None:
     return abs(limit - price) / price * 100
 
 
+def trailing_return_pct(bars: list[Any], days: int) -> float | None:
+    """Return over the last ``days`` sessions, from daily bars (bars[0] = latest)."""
+
+    if len(bars) <= days or not isinstance(bars[0], dict) or not isinstance(bars[days], dict):
+        return None
+    latest = _to_price(bars[0].get("close_pric") or bars[0].get("cur_prc"))
+    start = _to_price(bars[days].get("close_pric") or bars[days].get("cur_prc"))
+    if not latest or not start:
+        return None
+    return (latest / start - 1) * 100
+
+
+# Fewer scored peers than this and a cross-sectional mean says little.
+_MIN_PEERS = 10
+
+
+def annotate_peer_relative(rows: list[dict[str, Any]]) -> None:
+    """Add each row's 5-day return relative to the mean of the scanned rows.
+
+    Separates a dip the stock took alone from one it took with the market. On
+    the roster, 2024-04..2026-09, shallow MA20 dips that ran well below the
+    roster over the prior 5 days kept lagging it for the next 5-10 days, while
+    dips shared with the market recovered with it (`backtest.run disclosures`).
+    """
+
+    values = [r["return_5d_pct"] for r in rows if isinstance(r.get("return_5d_pct"), (int, float))]
+    peer = sum(values) / len(values) if len(values) >= _MIN_PEERS else None
+    for row in rows:
+        own = row.get("return_5d_pct")
+        row["peer_return_5d_pct"] = round(peer, 2) if peer is not None else None
+        row["excess_5d_vs_peers_pct"] = (
+            round(own - peer, 2) if peer is not None and isinstance(own, (int, float)) else None
+        )
+
+
 def _score_candidate(
     candidate: dict[str, Any],
     detail: dict[str, Any],
@@ -734,6 +769,8 @@ def _score_candidate(
     ma_dip_pct = moving_average_discount(current_price, moving_avg)
     volume_ratio = volume_ratio_vs_average(bars)
     upper_limit_distance = limit_distance_pct(current_price, _to_price(quote.get("upl_pric")))
+    return_5d = trailing_return_pct(bars, 5)
+    market_change = _to_float(regime.get("primary_change_pct"))
 
     reasons: list[str] = []
     if not regime.get("market_data_complete", True):
@@ -885,6 +922,16 @@ def _score_candidate(
         "prev_close": prev_close,
         "prev_high": prev_high,
         "day_change_pct": day_change_pct,
+        # How much of the move was the stock's own: today against the index
+        # the universe trades on, and the last 5 sessions against the scanned
+        # peers (filled in by `annotate_peer_relative` once all are scored).
+        "market_change_pct": market_change,
+        "excess_vs_market_pct": (
+            round(day_change_pct - market_change, 2)
+            if day_change_pct is not None and market_change is not None
+            else None
+        ),
+        "return_5d_pct": round(return_5d, 2) if return_5d is not None else None,
         "orderbook_ratio": round(orderbook_ratio, 2),
         "spread_pct": round(spread_pct, 3) if spread_pct is not None else None,
         "breakout": breakout,
@@ -1250,6 +1297,7 @@ async def plan_intraday_momentum_strategy(
         for action in holding_actions
         if action["action"] == "sell"
     ]
+    annotate_peer_relative(candidate_rows)
     planned_actions.extend(
         row["planned_action"]
         for row in candidate_rows

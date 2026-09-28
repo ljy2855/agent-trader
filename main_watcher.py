@@ -31,8 +31,25 @@ import sys
 from typing import Sequence
 
 from src.config import Settings
-from src.services.watcher import IntradayWatcher, WatcherConfig
+from src.services.krx_calendar import CLOSING_AUCTION_MINUTES
+from src.services.watcher import (
+    ENTRY_EXECUTION_IMMEDIATE,
+    ENTRY_EXECUTION_MODES,
+    IntradayWatcher,
+    WatcherConfig,
+)
 from src.constants.universe import UNIVERSE_LEADERS, UNIVERSE_MODES
+
+
+def _close_auction_screen_minutes(value: str) -> int:
+    """Screening has to open before the auction does, or nothing is ever held."""
+
+    minutes = int(value)
+    if minutes <= CLOSING_AUCTION_MINUTES:
+        raise argparse.ArgumentTypeError(
+            f"장 마감 동시호가({CLOSING_AUCTION_MINUTES}분)보다 길어야 한다: {minutes}"
+        )
+    return minutes
 
 
 def parse_watchlist_arg(raw: str | None) -> list[str] | None:
@@ -177,6 +194,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "— 소켓이 끊긴 동안의 이벤트는 재전송되지 않는다. 즉시 체결된 주문이 "
             "미체결 목록에 안 떠서 원장이 SUBMITTED로 멈추던 문제(2026-08-26)를 "
             "겨냥한다"
+        ),
+    )
+    p.add_argument(
+        "--entry-execution",
+        default=ENTRY_EXECUTION_IMMEDIATE,
+        choices=list(ENTRY_EXECUTION_MODES),
+        help=(
+            "승인된 후보의 매수 방식: immediate(승인 즉시 최우선 매도호가) | "
+            "close_auction(장 마감 전 스크리닝 → 장 마감 동시호가에 종가 단일가로 매수). "
+            "동시호가는 모든 주문이 한 가격에 체결돼 스프레드를 내지 않는다"
+        ),
+    )
+    p.add_argument(
+        "--close-auction-screen-minutes",
+        type=_close_auction_screen_minutes,
+        default=40,
+        help=(
+            "close_auction: 장 마감 N분 전부터 후보를 스크리너에 보낸다. "
+            "동시호가 시작 전까지 승인을 모아 두었다가 동시호가에 제출한다. 기본 40"
         ),
     )
     p.add_argument(
@@ -376,6 +412,8 @@ def _build_config(args: argparse.Namespace) -> WatcherConfig:
         day_change_min=args.day_change_min,
         day_change_max=args.day_change_max,
         entry_mode=args.entry_mode,
+        entry_execution=args.entry_execution,
+        close_auction_screen_minutes=args.close_auction_screen_minutes,
         universe_mode=args.universe_mode,
         record_candidate_scores=args.record_candidate_scores,
         enable_realtime_orders=args.enable_realtime_orders,

@@ -69,3 +69,29 @@ def test_regime_stability_ticks_reaches_the_watcher_config():
 def test_regime_stability_ticks_default_is_unchanged():
     args = main_watcher._build_arg_parser().parse_args([])
     assert main_watcher._build_config(args).regime_stability_ticks == 3
+
+
+def test_entry_execution_reaches_the_watcher_config():
+    args = main_watcher._build_arg_parser().parse_args(
+        ["--entry-execution", "close_auction", "--close-auction-screen-minutes", "30"]
+    )
+    config = main_watcher._build_config(args)
+
+    assert config.entry_execution == "close_auction"
+    assert config.close_auction_screen_minutes == 30
+
+
+def test_entry_execution_defaults_to_immediate():
+    config = main_watcher._build_config(main_watcher._build_arg_parser().parse_args([]))
+
+    assert config.entry_execution == "immediate"
+    assert config.close_auction_screen_minutes == 40
+
+
+def test_screening_window_must_open_before_the_closing_auction():
+    """At 10 minutes or less the window never opens before the auction does."""
+
+    with pytest.raises(SystemExit):
+        main_watcher._build_arg_parser().parse_args(
+            ["--close-auction-screen-minutes", "10"]
+        )

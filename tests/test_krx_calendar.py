@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -13,13 +13,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.config import Settings
 from src.services.krx_calendar import (
     DAY_UNCERTAIN,
+    SESSION_OPEN,
     SESSION_UNCERTAIN,
     SUPPORTED_KRX_CALENDAR_YEARS,
+    KrxSessionStatus,
+    closing_auction_start,
     is_krx_regular_session_open,
     is_krx_trading_day,
     krx_day_status,
     krx_regular_session_status,
     market_holiday_name,
+    session_close_datetime,
 )
 from src.services.order_ledger import OrderLedger
 from src.services.watcher import WatcherConfig, IntradayWatcher
@@ -139,3 +143,33 @@ def test_calendar_uncertainty_keeps_protective_cycles_alive_but_not_open():
     assert watcher._is_market_open(unsupported) is False
     assert watcher._should_run_tick(unsupported) is True
     assert _calendar_cycle_mode(unsupported) == CALENDAR_PROTECTIVE_ONLY
+
+
+def test_closing_auction_starts_ten_minutes_before_a_regular_close():
+    status = krx_regular_session_status(datetime(2026, 9, 4, 10, 0, tzinfo=KST))
+
+    assert session_close_datetime(status) == datetime(2026, 9, 4, 15, 30, tzinfo=KST)
+    assert closing_auction_start(status) == datetime(2026, 9, 4, 15, 20, tzinfo=KST)
+
+
+def test_closing_auction_follows_a_moved_close():
+    """A special session moves the close; the auction keeps its ten minutes."""
+
+    regular = krx_regular_session_status(datetime(2026, 9, 4, 10, 0, tzinfo=KST))
+    late = KrxSessionStatus(
+        observed_at=datetime(2026, 11, 19, 16, 0, tzinfo=KST),
+        state=SESSION_OPEN,
+        reason="test",
+        day_status=regular.day_status,
+        opens_at=time(10, 0),
+        closes_at=time(16, 30),
+    )
+
+    assert closing_auction_start(late) == datetime(2026, 11, 19, 16, 20, tzinfo=KST)
+
+
+def test_no_closing_auction_without_a_session():
+    holiday = krx_regular_session_status(datetime(2026, 9, 25, 10, 0, tzinfo=KST))
+
+    assert session_close_datetime(holiday) is None
+    assert closing_auction_start(holiday) is None

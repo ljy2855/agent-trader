@@ -5746,3 +5746,487 @@ def test_only_a_liquidation_registers_as_superseding(action, registers):
     asyncio.run(w._handle_trigger(_tier1_event(action), planner_result={}))
 
     assert ("005930" in w._protective_trigger_at) is registers
+
+
+# -- closing-auction entries (entry_execution=close_auction) -----------------
+
+# A regular Friday session: 09:00-15:30, closing auction 15:20-15:30.
+_AUCTION_DAY = (2026, 9, 4)
+_AUCTION_PLANNER = {
+    "portfolio": {"position_budget": 1_000_000, "max_positions": 1},
+    "regime": {"regime": "neutral"},
+}
+
+
+def _at(hour, minute, second=0, day=_AUCTION_DAY):
+    return datetime(*day, hour, minute, second, tzinfo=KST)
+
+
+def _move_clock(w, at):
+    status = watcher_module.krx_regular_session_status(at)
+    w._market_session_status = lambda now=None: status
+
+
+def _auction_watcher(at, *, dispatcher=None, **overrides):
+    w = _build_watcher(
+        dispatcher=dispatcher,
+        config=_config(entry_execution="close_auction", **overrides),
+    )
+    _move_clock(w, at)
+    return w
+
+
+def _auction_candidate(code="005930", price=287_000, detected_at=None):
+    return TriggerEvent(
+        trigger_type="new_candidate",
+        tier=2,
+        scope="stock",
+        target_role=ROLE_SCREENER,
+        stock_code=code,
+        stock_name="삼성전자",
+        snapshot={
+            "score": 9,
+            "current_price": price,
+            "entry_price": str(price),
+            "entry_order_type_code": "0",
+        },
+        detected_at=detected_at or _at(14, 55),
+        reason="new",
+    )
+
+
+def _auction_detail(price, prior_close=295_500):
+    """Quote plus 20 daily bars: today at ``price``, the 19 before at ``prior_close``.
+
+    With the defaults MA20 is 295,075 and 287,000 sits 2.7% under it — inside
+    the below_ma band.
+    """
+
+    bars = [{"cur_prc": str(price)}] + [{"cur_prc": str(prior_close)}] * 19
+    return {"success": True, "quote": {"cur_prc": str(price)}, "daily_bars": bars}
+
+
+def _stub_still_valid(w, detail, *, valid=True):
+    async def still_valid(event):
+        return valid, detail
+
+    w._is_still_valid = still_valid
+
+
+def _record_buys(monkeypatch, response=None):
+    buys: list[dict] = []
+
+    async def fake_buy(client, **kwargs):
+        buys.append(kwargs)
+        return response or _ok_order(order_no="0001234")
+
+    monkeypatch.setattr(watcher_module.order_service, "place_stock_buy_order", fake_buy)
+    return buys
+
+
+def _held(w, code="005930", action="TIER1", day="2026-09-04"):
+    w._close_auction_entries[code] = watcher_module.CloseAuctionEntry(
+        trigger=_auction_candidate(code),
+        action=action,
+        held_at=_at(14, 55),
+        trading_day=day,
+    )
+
+
+def test_close_auction_phase_follows_the_session_clock():
+    w = _auction_watcher(_at(10, 0))
+    expected = [
+        (_at(10, 0), watcher_module.AUCTION_PHASE_WAIT),
+        (_at(14, 49, 59), watcher_module.AUCTION_PHASE_WAIT),
+        (_at(14, 50), watcher_module.AUCTION_PHASE_SCREEN),
+        (_at(15, 19, 59), watcher_module.AUCTION_PHASE_SCREEN),
+        (_at(15, 20), watcher_module.AUCTION_PHASE_SUBMIT),
+        (_at(15, 27, 59), watcher_module.AUCTION_PHASE_SUBMIT),
+        (_at(15, 28), watcher_module.AUCTION_PHASE_CLOSED),
+        # 추석 — no session, so nothing may be screened, held or sent.
+        (datetime(2026, 9, 25, 15, 0, tzinfo=KST), watcher_module.AUCTION_PHASE_CLOSED),
+    ]
+    for at, phase in expected:
+        _move_clock(w, at)
+        assert w._close_auction_phase() == phase, at
+
+
+def test_immediate_execution_has_no_auction_phase():
+    assert _build_watcher()._close_auction_phase() is None
+
+
+def test_approval_before_the_auction_is_held_not_bought(monkeypatch):
+    buys = _record_buys(monkeypatch)
+    w = _auction_watcher(_at(14, 55))
+
+    result = asyncio.run(
+        w._apply_action(_auction_candidate(), "TIER1", _AUCTION_PLANNER)
+    )
+
+    assert buys == []
+    assert result.state == "informational"
+    assert "동시호가" in (result.reason or "") and "15:20" in (result.reason or "")
+    assert list(w._close_auction_entries) == ["005930"]
+    assert w.status.snapshot()["close_auction_entries"][0]["action"] == "TIER1"
+
+
+def test_held_entry_goes_into_the_auction_as_a_capped_limit(monkeypatch):
+    buys = _record_buys(monkeypatch)
+    w = _auction_watcher(_at(14, 55))
+    asyncio.run(w._apply_action(_auction_candidate(), "TIER1", _AUCTION_PLANNER))
+
+    _move_clock(w, _at(15, 21))
+    _stub_still_valid(w, _auction_detail(287_000))
+    asyncio.run(w._submit_close_auction_entries(_AUCTION_PLANNER))
+
+    assert len(buys) == 1
+    # A limit, not a market order: capped at the stale bound (287,000 x 1.015
+    # floored to the 500-won tick). The auction fills it at the single close.
+    assert buys[0]["order_type_code"] == "0"
+    assert buys[0]["ord_uv"] == "291000"
+    # Sized at the reference price, not the cap.
+    assert buys[0]["ord_qty"] == "3"
+    assert w._close_auction_entries == {}
+    assert w.status.snapshot()["close_auction_entries"] == []
+    assert ("2026-09-04", "1234") in w._close_auction_orders
+    # The ledger keeps what the order carries, so an unnumbered broker row
+    # can still be matched on price.
+    assert [intent.price for intent in w._ledger.unresolved()] == [291_000]
+    assert any(
+        kind == "success" and "동시호가" in title for kind, title, _ in w._notifier.calls
+    )
+
+
+def test_held_entry_is_dropped_when_the_price_moved_past_the_stale_bound(monkeypatch):
+    buys = _record_buys(monkeypatch)
+    w = _auction_watcher(_at(14, 55))
+    asyncio.run(w._apply_action(_auction_candidate(), "TIER1", _AUCTION_PLANNER))
+
+    _move_clock(w, _at(15, 21))
+    _stub_still_valid(w, _auction_detail(292_000), valid=False)
+    asyncio.run(w._submit_close_auction_entries(_AUCTION_PLANNER))
+
+    assert buys == []
+    assert w._close_auction_entries == {}
+    assert any(
+        kind == "warn" and "취소" in title and "가격 변동" in body
+        for kind, title, body in w._notifier.calls
+    )
+
+
+def test_held_entry_is_dropped_when_the_close_leaves_the_ma_band(monkeypatch):
+    """Back above MA20 by the close: no longer the dip that was approved."""
+
+    buys = _record_buys(monkeypatch)
+    w = _auction_watcher(_at(14, 55), entry_mode="below_ma")
+    asyncio.run(w._apply_action(_auction_candidate(), "TIER1", _AUCTION_PLANNER))
+
+    _move_clock(w, _at(15, 21))
+    _stub_still_valid(w, _auction_detail(298_000))
+    asyncio.run(w._submit_close_auction_entries(_AUCTION_PLANNER))
+
+    assert buys == []
+    assert any(
+        kind == "warn" and "밴드 이탈" in body for kind, _, body in w._notifier.calls
+    )
+
+
+def test_a_crash_by_the_close_cancels_the_held_entry(monkeypatch):
+    buys = _record_buys(monkeypatch)
+    w = _auction_watcher(_at(14, 55))
+    asyncio.run(w._apply_action(_auction_candidate(), "TIER1", _AUCTION_PLANNER))
+
+    _move_clock(w, _at(15, 21))
+    _stub_still_valid(w, _auction_detail(287_000))
+    w._prev_regime = {"regime": "risk_off", "extreme_risk_off": True}
+    asyncio.run(w._submit_close_auction_entries(_AUCTION_PLANNER))
+
+    assert buys == []
+
+
+def test_approval_inside_the_auction_is_submitted_at_once(monkeypatch):
+    buys = _record_buys(monkeypatch)
+    w = _auction_watcher(_at(15, 22))
+    _stub_still_valid(w, _auction_detail(287_000))
+
+    result = asyncio.run(
+        w._apply_action(_auction_candidate(), "TIER2", _AUCTION_PLANNER)
+    )
+
+    assert result.state == "submitted"
+    assert buys[0]["ord_uv"] == "291000"
+    assert buys[0]["ord_qty"] == "1"  # TIER2 = half budget
+    assert w._close_auction_entries == {}
+
+
+def test_approval_after_the_submission_cutoff_is_skipped(monkeypatch):
+    buys = _record_buys(monkeypatch)
+    w = _auction_watcher(_at(15, 28, 30))
+
+    result = asyncio.run(
+        w._apply_action(_auction_candidate(), "TIER1", _AUCTION_PLANNER)
+    )
+
+    assert buys == []
+    assert result.state == "skipped"
+    assert "마감" in (result.reason or "")
+
+
+def test_dry_run_holds_nothing_and_submits_nothing(monkeypatch):
+    buys = _record_buys(monkeypatch)
+    w = _auction_watcher(_at(14, 55), execute_orders=False)
+
+    result = asyncio.run(
+        w._apply_action(_auction_candidate(), "TIER1", _AUCTION_PLANNER)
+    )
+    assert result.state == "skipped"
+    assert w._close_auction_entries == {}
+
+    # Even an entry that is somehow held never reaches the broker.
+    _held(w)
+    _move_clock(w, _at(15, 21))
+    _stub_still_valid(w, _auction_detail(287_000))
+    asyncio.run(w._submit_close_auction_entries(_AUCTION_PLANNER))
+    assert buys == []
+
+
+def _auction_plan(candidate_rows, *, open_order_count=0):
+    async def fake_plan(*args, **kwargs):
+        return {
+            "success": True,
+            "holdings": [],
+            "regime": {"regime": "neutral"},
+            "candidate_rows": candidate_rows,
+            "portfolio": {
+                "open_order_count": open_order_count,
+                "estimated_assets": 1_000_000,
+                "position_budget": 1_000_000,
+                "max_positions": 1,
+            },
+        }
+
+    return fake_plan
+
+
+def _qualifying_row(code="005930", score=9):
+    return {
+        "stock_code": code,
+        "stock_name": "삼성전자",
+        "eligible": True,
+        "score": score,
+        "current_price": 287_000,
+        "entry_price": "287000",
+        "entry_order_type_code": "0",
+        "ma_dip_pct": 2.7,
+    }
+
+
+def _screened_codes(w):
+    return [
+        entry["stock_code"]
+        for entry in w.status.recent()
+        if entry["trigger_type"] == "new_candidate"
+    ]
+
+
+def test_screener_is_first_asked_when_the_screening_window_opens(monkeypatch):
+    """A name in the band all morning must still read as new at 14:50."""
+
+    monkeypatch.setattr(
+        watcher_module, "plan_intraday_momentum_strategy", _auction_plan([_qualifying_row()])
+    )
+    w = _auction_watcher(
+        _at(10, 0),
+        dispatcher=StubDispatcher(action=None),
+        new_candidate_min_score=8,
+        max_positions=1,
+    )
+
+    async def driver():
+        await w._tick(now=_at(10, 0))
+        morning = _screened_codes(w)
+        _move_clock(w, _at(14, 51))
+        await w._tick(now=_at(14, 51))
+        window = _screened_codes(w)
+        await w._cancel_in_flight()
+        return morning, window
+
+    morning, window = asyncio.run(driver())
+
+    assert morning == []
+    assert window == ["005930"]
+
+
+def test_a_held_entry_reserves_its_slot(monkeypatch):
+    monkeypatch.setattr(
+        watcher_module,
+        "plan_intraday_momentum_strategy",
+        _auction_plan([_qualifying_row("000660")]),
+    )
+    w = _auction_watcher(
+        _at(14, 55),
+        dispatcher=StubDispatcher(action=None),
+        new_candidate_min_score=8,
+        max_positions=1,
+    )
+    _held(w, "005930")
+
+    async def driver():
+        await w._tick(now=_at(14, 55))
+        await w._cancel_in_flight()
+
+    asyncio.run(driver())
+
+    assert _screened_codes(w) == []
+
+
+def test_the_first_auction_tick_submits_the_held_entry(monkeypatch):
+    buys = _record_buys(monkeypatch)
+    monkeypatch.setattr(watcher_module, "plan_intraday_momentum_strategy", _auction_plan([]))
+    w = _auction_watcher(_at(14, 55))
+    asyncio.run(w._apply_action(_auction_candidate(), "TIER1", _AUCTION_PLANNER))
+
+    _move_clock(w, _at(15, 20, 10))
+    _stub_still_valid(w, _auction_detail(287_000))
+    asyncio.run(w._tick(now=_at(15, 20, 10)))
+
+    assert len(buys) == 1
+    assert buys[0]["ord_uv"] == "291000"
+
+
+def test_an_entry_still_held_after_the_cutoff_is_dropped_with_a_warning(monkeypatch):
+    buys = _record_buys(monkeypatch)
+    monkeypatch.setattr(watcher_module, "plan_intraday_momentum_strategy", _auction_plan([]))
+    w = _auction_watcher(_at(15, 28, 10))
+    _held(w)
+
+    asyncio.run(w._tick(now=_at(15, 28, 10)))
+
+    assert buys == []
+    assert w._close_auction_entries == {}
+    assert any(kind == "warn" and "미제출" in title for kind, title, _ in w._notifier.calls)
+
+
+def test_an_entry_from_a_previous_session_is_dropped(monkeypatch):
+    buys = _record_buys(monkeypatch)
+    monkeypatch.setattr(watcher_module, "plan_intraday_momentum_strategy", _auction_plan([]))
+    w = _auction_watcher(datetime(2026, 9, 7, 15, 21, tzinfo=KST))
+    _held(w, day="2026-09-04")
+
+    asyncio.run(w._tick(now=datetime(2026, 9, 7, 15, 21, tzinfo=KST)))
+
+    assert buys == []
+    assert w._close_auction_entries == {}
+
+
+def _stale_event(order_no):
+    return TriggerEvent(
+        trigger_type="stale_unfilled_order",
+        tier=1,
+        scope="stock",
+        target_role=ROLE_SELF,
+        stock_code="005930",
+        stock_name="삼성전자",
+        snapshot={"order_no": order_no, "qty": "3"},
+        detected_at=_at(15, 26),
+        reason="stale",
+        suggested_action="cancel_order",
+        metadata={"order_no": order_no},
+    )
+
+
+def test_only_our_own_auction_order_is_exempt_from_the_stale_cancel():
+    w = _auction_watcher(_at(15, 26))
+    w._close_auction_orders = {("2026-09-04", "1234")}
+
+    assert w._is_close_auction_order(_stale_event("0001234")) is True
+    assert w._is_close_auction_order(_stale_event("0009999")) is False
+    # Order numbers are a daily sequence: the same number tomorrow is not ours.
+    _move_clock(w, datetime(2026, 9, 7, 15, 26, tzinfo=KST))
+    assert w._is_close_auction_order(_stale_event("0001234")) is False
+
+
+def test_tick_does_not_cancel_the_auction_order_resting_until_the_close(monkeypatch):
+    cancels: list[dict] = []
+
+    async def fake_cancel(client, **kwargs):
+        cancels.append(kwargs)
+        return _ok_order()
+
+    monkeypatch.setattr(watcher_module.order_service, "cancel_stock_order", fake_cancel)
+    monkeypatch.setattr(
+        watcher_module, "plan_intraday_momentum_strategy", _auction_plan([], open_order_count=2)
+    )
+    monkeypatch.setattr(
+        watcher_module.triggers,
+        "detect_tier1_stale_orders",
+        lambda open_orders, *, stale_minutes, now=None: [
+            _stale_event("0001234"),
+            _stale_event("0009999"),
+        ],
+    )
+    w = _auction_watcher(_at(15, 26))
+    w._close_auction_orders = {("2026-09-04", "1234")}
+
+    asyncio.run(w._tick(now=_at(15, 26)))
+
+    assert [call["orig_ord_no"] for call in cancels] == ["0009999"]
+
+
+def test_post_close_reconcile_runs_only_just_after_the_close_with_work_pending():
+    w = _auction_watcher(_at(15, 31))
+    calls: list[dict] = []
+
+    async def reconcile(**kwargs):
+        calls.append(kwargs)
+        return True
+
+    w._reconcile_ledger = reconcile
+    session = watcher_module.krx_regular_session_status
+
+    # Nothing pending: sleep as usual.
+    assert asyncio.run(w._post_close_reconcile(session(_at(15, 31)))) is False
+
+    w._ledger.record_intent(
+        stock_code="005930",
+        side=watcher_module.order_ledger.SIDE_BUY,
+        quantity=3,
+        price=291_000,
+        origin="new_candidate",
+        decision_scope="TIER1",
+    )
+    assert asyncio.run(w._post_close_reconcile(session(_at(15, 31)))) is True
+    assert calls == [{"fetch_open_orders": True, "fetch_executions": True}]
+    # Not while the session is still open, and not once the window has passed.
+    assert asyncio.run(w._post_close_reconcile(session(_at(15, 29)))) is False
+    assert asyncio.run(w._post_close_reconcile(session(_at(15, 51)))) is False
+
+    immediate = _build_watcher()
+    immediate._ledger = w._ledger
+    assert asyncio.run(immediate._post_close_reconcile(session(_at(15, 31)))) is False
+
+
+def test_screener_is_told_the_approval_buys_at_the_close():
+    planner = {"portfolio": {"holding_count": 0, "estimated_assets": 1_000_000}}
+
+    auction = _auction_watcher(_at(14, 55))._build_trigger_comment(
+        _auction_candidate(), planner
+    )
+    immediate = _build_watcher()._build_trigger_comment(_auction_candidate(), planner)
+
+    assert "즉시 매수가 아니다" in auction and "15:20~15:30" in auction
+    assert "즉시 매수가 아니다" not in immediate
+
+
+def test_screener_is_told_how_to_read_the_relative_move():
+    planner = {"portfolio": {"holding_count": 0, "estimated_assets": 1_000_000}}
+    with_fields = replace(
+        _auction_candidate(),
+        snapshot={**_auction_candidate().snapshot, "excess_5d_vs_peers_pct": -2.4},
+    )
+
+    text = _build_watcher()._build_trigger_comment(with_fields, planner)
+    bare = _build_watcher()._build_trigger_comment(_auction_candidate(), planner)
+
+    assert "하락의 성격" in text and "excess_5d_vs_peers_pct" in text
+    assert "하락의 성격" not in bare

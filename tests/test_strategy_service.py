@@ -1009,3 +1009,64 @@ def test_an_incomplete_read_is_sticky_too() -> None:
     assert regime["market_data_complete"] is False
     assert regime["extreme_risk_off"] is True
     assert regime["extreme_risk_off_sticky"] is True
+
+
+# --- how much of a move was the stock's own --------------------------------
+
+
+def test_trailing_return_reads_the_latest_close_against_n_sessions_back() -> None:
+    bars = [{"close_pric": "110"}] + [{"close_pric": "105"}] * 4 + [{"close_pric": "100"}]
+
+    assert round(strategy_module.trailing_return_pct(bars, 5), 6) == 10.0
+
+
+def test_trailing_return_needs_the_whole_window() -> None:
+    assert strategy_module.trailing_return_pct([{"close_pric": "110"}] * 5, 5) is None
+    assert strategy_module.trailing_return_pct([{"close_pric": "110"}] + [{}] * 5, 5) is None
+
+
+def test_scored_row_carries_the_move_against_the_index_and_5_sessions() -> None:
+    # MA20 stays near 10,000, today 9,900 (a 1% dip); five sessions ago 9,500.
+    cand, detail = _below_ma_detail(9900, [9900] + [10000] * 4 + [9500] + [10000] * 14)
+    regime = {**_NEUTRAL, "primary_change_pct": -2.5}
+
+    _, scored = strategy_module._score_candidate(cand, detail, regime, entry_mode="below_ma")
+
+    assert scored["market_change_pct"] == -2.5
+    # flu_rt -1.0 today against -2.5 for the index: it fell less than the market.
+    assert scored["excess_vs_market_pct"] == 1.5
+    assert scored["return_5d_pct"] == round((9900 / 9500 - 1) * 100, 2)
+
+
+def test_scored_row_leaves_the_market_relative_blank_without_an_index_read() -> None:
+    cand, detail = _below_ma_detail(9900, [10000] * 20)
+
+    _, scored = strategy_module._score_candidate(cand, detail, _NEUTRAL, entry_mode="below_ma")
+
+    assert scored["market_change_pct"] is None
+    assert scored["excess_vs_market_pct"] is None
+
+
+def test_peer_relative_return_is_measured_against_the_scanned_mean() -> None:
+    rows = [{"return_5d_pct": float(v)} for v in range(10)]  # mean 4.5
+    rows.append({"return_5d_pct": None})
+
+    strategy_module.annotate_peer_relative(rows)
+
+    assert rows[0]["peer_return_5d_pct"] == 4.5
+    assert rows[0]["excess_5d_vs_peers_pct"] == -4.5
+    assert rows[9]["excess_5d_vs_peers_pct"] == 4.5
+    # A row without its own return still sees the peers, but has no excess.
+    assert rows[10]["peer_return_5d_pct"] == 4.5
+    assert rows[10]["excess_5d_vs_peers_pct"] is None
+
+
+def test_peer_relative_return_needs_enough_peers() -> None:
+    rows = [{"return_5d_pct": 1.0} for _ in range(9)]
+
+    strategy_module.annotate_peer_relative(rows)
+
+    assert all(
+        r["peer_return_5d_pct"] is None and r["excess_5d_vs_peers_pct"] is None
+        for r in rows
+    )

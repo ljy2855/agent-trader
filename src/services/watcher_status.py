@@ -131,6 +131,8 @@ class WatcherStatusRegistry:
         }
         # The last tick's candidate board — see ``summarize_candidates``.
         self._candidates: dict[str, Any] | None = None
+        # Approvals waiting for the closing auction (entry_execution=close_auction).
+        self._close_auction_entries: list[dict[str, Any]] = []
         # What the previous process last persisted, loaded once at startup.
         # Everything above is in-memory and empty until the first tick, which
         # outside market hours never comes: after a holiday-morning rollout the
@@ -355,6 +357,12 @@ class WatcherStatusRegistry:
         with self._lock:
             self._candidates = dict(board) if board is not None else None
 
+    def set_close_auction_entries(self, entries: list[dict[str, Any]]) -> None:
+        """Publish approvals held for the closing auction (in-memory only)."""
+
+        with self._lock:
+            self._close_auction_entries = [dict(entry) for entry in entries]
+
     def set_last_session(self, payload: dict[str, Any] | None) -> None:
         """Publish the previous process's persisted snapshot, as read."""
 
@@ -395,6 +403,9 @@ class WatcherStatusRegistry:
                 "candidates": (
                     dict(self._candidates) if self._candidates is not None else None
                 ),
+                "close_auction_entries": [
+                    dict(entry) for entry in self._close_auction_entries
+                ],
                 "last_session": (
                     dict(self._last_session) if self._last_session else None
                 ),
