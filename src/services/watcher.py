@@ -64,6 +64,7 @@ from .krx_calendar import (
     closing_auction_start,
     is_krx_regular_session_open,
     krx_regular_session_status,
+    next_regular_session_open,
     session_close_datetime,
 )
 from .krx_ticks import floor_to_stock_tick
@@ -144,6 +145,10 @@ CLOSE_AUCTION_SUBMIT_CUTOFF = timedelta(minutes=2)
 # would otherwise go to sleep — and the execution query only returns today's
 # fills, so a fill missed today can never settle its intent tomorrow.
 POST_CLOSE_RECONCILE_WINDOW = timedelta(minutes=20)
+# Floor for the off-hours sleep that is cut short to end at the open. A timer
+# can fire a few milliseconds before the wall clock gets there; without a
+# floor the loop would see the session still closed and spin on the remainder.
+MIN_OFF_HOURS_SLEEP_SECONDS = 1.0
 
 # Where the session stands for close-auction entries.
 AUCTION_PHASE_WAIT = "wait"      # before screening opens: no candidate dispatch
@@ -645,7 +650,7 @@ class IntradayWatcher:
                         )
                         continue
                     await self._sleep_with_stop(
-                        self._config.off_hours_interval_seconds
+                        self._off_hours_sleep_seconds(session)
                     )
                     continue
                 if session.state == SESSION_UNCERTAIN:
@@ -3823,7 +3828,32 @@ class IntradayWatcher:
             self._status.remove_in_flight(slot.scope_key)
         self._in_flight.clear()
 
-    async def _sleep_with_stop(self, seconds: int) -> None:
+    def _off_hours_sleep_seconds(self, session: KrxSessionStatus) -> float:
+        """How long to sleep while the market is closed.
+
+        The off-hours interval, cut short so the last sleep ends at the next
+        open. A fixed interval lands on 09:00 only when the process has been
+        up since the previous close — 15:30 to 09:00 is a whole number of
+        ten-minute sleeps. Restarted off hours, the loop wakes wherever the
+        restart left its phase, up to one interval late: a rollout at 20:35:37
+        opened 2026-09-30 at 09:05:37 with a position held, so the first
+        minutes of the session — where an overnight gap shows up — had no
+        stop-loss check at all.
+
+        Waking early costs nothing, the loop only re-reads the session. So
+        an uncertain day is a target like any other, and with no open in
+        sight (past the supported calendar) the plain interval applies.
+        """
+
+        interval = float(self._config.off_hours_interval_seconds)
+        upcoming = next_regular_session_open(session.observed_at)
+        if upcoming is None:
+            return interval
+        opens_at, _uncertain = upcoming
+        remaining = (opens_at - session.observed_at).total_seconds()
+        return min(interval, max(remaining, MIN_OFF_HOURS_SLEEP_SECONDS))
+
+    async def _sleep_with_stop(self, seconds: float) -> None:
         if seconds <= 0:
             return
         try:

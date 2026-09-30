@@ -263,11 +263,12 @@ def next_regular_session_open(
 ) -> tuple[datetime, bool] | None:
     """When the next regular session opens, and whether that day is uncertain.
 
-    Display only — nothing may gate an order on this. An uncertain day is
-    still returned (flagged) rather than skipped: skipping would report a
-    later date as "next open" on a day the market may well trade, and the
-    flag already tells the reader not to rely on it. Returns None past the
-    horizon or the supported calendar, where there is nothing honest to say.
+    For display and for timing the watcher's wake-up — nothing may gate an
+    order on this. An uncertain day is still returned (flagged) rather than
+    skipped: skipping would report a later date as "next open" on a day the
+    market may well trade, and the flag already tells the reader not to rely
+    on it. Returns None past the horizon or the supported calendar, where
+    there is nothing honest to say.
     """
 
     current = _as_kst(now)

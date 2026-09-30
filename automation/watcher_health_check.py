@@ -18,7 +18,11 @@ Two failure shapes, both covered:
 
 Alerting is gated to KRX regular sessions: off-hours the watcher
 deliberately sleeps in a 600s loop, so "stale" is normal then and paging
-on it would train the operator to ignore the channel.
+on it would train the operator to ignore the channel. The first stale
+window after the open is gated the same way — the last tick on record is
+still yesterday's until today's first one finishes — so the run at the
+open only checks that the watcher answers, and the next run judges the
+loop.
 
 **Spam control.** A state file on a small dedicated PVC tracks the last
 alert; repeat alerts for a continuing outage are suppressed for
@@ -44,9 +48,13 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:
-    from src.services.krx_calendar import is_krx_regular_session_open
+    from src.services.krx_calendar import (
+        is_krx_regular_session_open,
+        krx_regular_session_status,
+    )
 except Exception:  # pragma: no cover - import fallback
     is_krx_regular_session_open = None  # type: ignore[assignment]
+    krx_regular_session_status = None  # type: ignore[assignment]
 
 KST = timezone(timedelta(hours=9))
 
@@ -115,9 +123,43 @@ def _post_discord(title: str, description: str, color: int) -> None:
         _err(f"discord post failed: {exc}")
 
 
-def check(stale_minutes: int) -> tuple[bool, list[str], dict]:
-    """Return (healthy, problems, state_snapshot)."""
+def session_age_minutes(now: datetime) -> float | None:
+    """Minutes since today's regular session opened, or None when unknown.
+
+    None covers a closed or uncertain session and a missing calendar alike:
+    with no open to measure from, the tick is judged on the wall clock alone.
+    """
+
+    if krx_regular_session_status is None:
+        return None
+    status = krx_regular_session_status(now)
+    if not status.is_open or status.opens_at is None:
+        return None
+    observed = status.observed_at
+    opened = datetime.combine(observed.date(), status.opens_at, tzinfo=observed.tzinfo)
+    return (observed - opened).total_seconds() / 60
+
+
+def check(
+    stale_minutes: int, *, session_age_min: float | None = None
+) -> tuple[bool, list[str], dict]:
+    """Return (healthy, problems, state_snapshot).
+
+    ``session_age_min`` is how long the session has been open. Until it has
+    been open for a full stale window the loop does not owe a fresh tick yet,
+    and neither an old nor a missing ``last_tick_at`` is a problem.
+    """
     problems: list[str] = []
+
+    # The run at the open reads /state a few seconds into the session, and
+    # `last_tick_at` is stamped when a tick *finishes* — the first one of a
+    # day works a cold cache for about ten seconds. So what that run sees on
+    # a healthy watcher is yesterday's close, 17.5 hours old, or nothing at
+    # all if the process restarted overnight. Judged on the wall clock that
+    # paged "루프 정지 의심" at every open and the all-clear ten minutes later
+    # — a daily alarm is one nobody reads. main() already gates the hours
+    # outside the session; this is the same gate for its first minutes.
+    tick_due = session_age_min is None or session_age_min >= stale_minutes
 
     health = _get_json(f"{WATCHER_BASE}/health")
     if health is None:
@@ -152,14 +194,14 @@ def check(stale_minutes: int) -> tuple[bool, list[str], dict]:
         try:
             tick_dt = datetime.fromisoformat(str(last_tick).replace("Z", "+00:00"))
             age_min = (datetime.now(timezone.utc) - tick_dt.astimezone(timezone.utc)).total_seconds() / 60
-            if age_min > stale_minutes:
+            if age_min > stale_minutes and tick_due:
                 problems.append(
                     f"last_tick {age_min:.0f}분 전 (임계 {stale_minutes}분) — "
                     f"루프 정지 의심 (cycle {state.get('cycle_count')})"
                 )
         except (ValueError, TypeError):
             problems.append(f"last_tick_at 파싱 불가: {last_tick!r}")
-    elif not just_started:
+    elif not just_started and tick_due:
         age_note = (
             f" (기동 {started_age_min:.0f}분 경과)" if started_age_min is not None else ""
         )
@@ -189,10 +231,21 @@ def main() -> int:
         print(f"{now:%Y-%m-%d %H:%M} KST — 장외/휴장, 검사 skip")
         return 0
 
-    healthy, problems, state = check(args.stale_minutes)
+    session_age = session_age_minutes(now)
+    healthy, problems, state = check(args.stale_minutes, session_age_min=session_age)
     prev = _load_state()
     was_alerting = bool(prev.get("alerting"))
     last_alert_raw = prev.get("last_alert_at")
+
+    if healthy and session_age is not None and session_age < args.stale_minutes:
+        # Too early to vouch for the loop. Not an alarm, and not an all-clear
+        # either: a recovery notice here would close an outage that the next
+        # run is about to confirm. State is left exactly as it was.
+        print(
+            f"{now:%H:%M} ⏳ 개장 {session_age:.1f}분 — 첫 틱 판정은 다음 검사에서 "
+            f"(last_tick {str(state.get('last_tick_at'))[:19]})"
+        )
+        return 0
 
     if healthy:
         print(f"{now:%H:%M} 🟢 watcher 정상 (cycle {state.get('cycle_count')})")

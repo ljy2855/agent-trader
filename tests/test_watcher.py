@@ -6230,3 +6230,86 @@ def test_screener_is_told_how_to_read_the_relative_move():
 
     assert "하락의 성격" in text and "excess_5d_vs_peers_pct" in text
     assert "하락의 성격" not in bare
+
+
+# -- off-hours sleep: waking at the open -------------------------------------
+
+
+def _closed_session(*parts):
+    return watcher_module.krx_regular_session_status(datetime(*parts, tzinfo=KST))
+
+
+def test_off_hours_sleep_is_the_interval_when_the_open_is_far_off():
+    w = _build_watcher()
+    # Just after the close: the next open is 17.5 hours away.
+    assert w._off_hours_sleep_seconds(_closed_session(2026, 9, 29, 15, 31)) == 600
+
+
+def test_last_off_hours_sleep_ends_at_the_open():
+    w = _build_watcher()
+    # The phase a 20:35:37 restart leaves behind: awake at 08:55:37, and a
+    # full interval from here would sleep through the first 5m37s of the
+    # session.
+    assert w._off_hours_sleep_seconds(_closed_session(2026, 9, 30, 8, 55, 37)) == 263
+
+
+def test_off_hours_sleep_has_a_floor_so_an_early_timer_does_not_spin():
+    w = _build_watcher()
+    early = _closed_session(2026, 9, 30, 8, 59, 59, 998_000)
+    assert early.state == watcher_module.SESSION_CLOSED
+    assert (
+        w._off_hours_sleep_seconds(early)
+        == watcher_module.MIN_OFF_HOURS_SLEEP_SECONDS
+    )
+
+
+def test_off_hours_sleep_does_not_aim_at_a_holiday_morning():
+    w = _build_watcher()
+    # 2026-10-05 is a substitute holiday (Monday): 09:00 that day is not an
+    # open, and the real one is a day away.
+    holiday = _closed_session(2026, 10, 5, 8, 55, 37)
+    assert w._off_hours_sleep_seconds(holiday) == 600
+
+
+def test_off_hours_sleep_follows_a_delayed_special_session():
+    w = _build_watcher()
+    # 2026-01-02 opens at 10:00. 09:00 is still closed; 09:55 is five
+    # minutes from the open.
+    assert w._off_hours_sleep_seconds(_closed_session(2026, 1, 2, 8, 55)) == 600
+    assert w._off_hours_sleep_seconds(_closed_session(2026, 1, 2, 9, 55)) == 300
+
+
+def test_off_hours_sleep_falls_back_past_the_supported_calendar():
+    w = _build_watcher()
+    # Year-end closure, and 2027 is not a verified year: no open to aim at.
+    assert w._off_hours_sleep_seconds(_closed_session(2026, 12, 31, 20, 0)) == 600
+
+
+def test_loop_ticks_at_the_open_after_an_off_hours_restart(tmp_path):
+    # Drives run() itself, with the clock, the sleep and the tick replaced:
+    # the restart time is the one that opened 2026-09-30 at 09:05:37.
+    clock = [datetime(2026, 9, 29, 20, 35, 37, tzinfo=KST)]
+    w = _build_watcher()
+    w._state_path = tmp_path / "watcher_state.json"
+    w._market_session_status = (
+        lambda now=None: watcher_module.krx_regular_session_status(clock[0])
+    )
+    sleeps: list[float] = []
+    ticks: list[datetime] = []
+
+    async def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += timedelta(seconds=seconds)
+
+    async def tick(*, now=None):
+        ticks.append(now)
+        w.stop()
+
+    w._sleep_with_stop = sleep
+    w._tick = tick
+
+    asyncio.run(w.run())
+
+    assert ticks == [datetime(2026, 9, 30, 9, 0, tzinfo=KST)]
+    off_hours = sleeps[:-1]  # the last one is the poll interval after the tick
+    assert max(off_hours) == 600 and off_hours[-1] == 263

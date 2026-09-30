@@ -112,15 +112,85 @@ def test_unparseable_tick_is_a_problem(monkeypatch):
     assert any("파싱 불가" in p for p in problems)
 
 
+# --- the first minutes of a session --------------------------------------
+
+# What /state holds when the 09:00 run reads it, about eight seconds in.
+_AT_THE_OPEN = 8 / 60
+
+
+def test_yesterdays_tick_is_not_stale_at_the_open(monkeypatch):
+    # Up since yesterday: the last tick on record is the 15:29 one, 17.5
+    # hours old, because today's first tick has not finished yet.
+    _stub_endpoints(monkeypatch, health={"status": "ok"},
+                    state={"last_tick_at": _iso(1050), "cycle_count": 733})
+    healthy, problems, _ = hc.check(stale_minutes=5, session_age_min=_AT_THE_OPEN)
+    assert healthy, problems
+
+
+def test_no_tick_is_not_a_problem_at_the_open_after_an_overnight_restart(monkeypatch):
+    # Restarted the evening before: `last_tick_at` lives in process memory,
+    # so there is none until the first tick of the new process.
+    _stub_endpoints(monkeypatch, health={"status": "ok"},
+                    state={"started_at": _iso(745)})
+    healthy, problems, _ = hc.check(stale_minutes=5, session_age_min=_AT_THE_OPEN)
+    assert healthy, problems
+
+
+def test_stale_tick_pages_once_the_session_is_a_stale_window_old(monkeypatch):
+    # The next run, ten minutes in: a loop that never woke is now overdue.
+    _stub_endpoints(monkeypatch, health={"status": "ok"},
+                    state={"last_tick_at": _iso(1060), "cycle_count": 733})
+    healthy, problems, _ = hc.check(stale_minutes=5, session_age_min=10)
+    assert not healthy
+    assert any("루프 정지 의심" in p for p in problems)
+
+    _stub_endpoints(monkeypatch, health={"status": "ok"},
+                    state={"started_at": _iso(755)})
+    healthy, problems, _ = hc.check(stale_minutes=5, session_age_min=10)
+    assert not healthy
+    assert any("루프가 한 번도 돌지 않음" in p for p in problems)
+
+
+def test_the_open_does_not_excuse_a_watcher_that_is_down_or_erroring(monkeypatch):
+    _stub_endpoints(monkeypatch, health=None, state=None)
+    healthy, problems, _ = hc.check(stale_minutes=5, session_age_min=_AT_THE_OPEN)
+    assert not healthy
+    assert any("응답 없음" in p for p in problems)
+
+    _stub_endpoints(monkeypatch, health={"status": "ok"},
+                    state={"last_tick_at": _iso(1050), "last_error": "boom"})
+    healthy, problems, _ = hc.check(stale_minutes=5, session_age_min=_AT_THE_OPEN)
+    assert not healthy
+    assert any("boom" in p for p in problems)
+
+
+def test_session_age_is_measured_from_the_days_open():
+    kst = hc.KST
+    assert hc.session_age_minutes(
+        datetime(2026, 9, 30, 9, 0, 8, tzinfo=kst)
+    ) == pytest.approx(8 / 60)
+    assert hc.session_age_minutes(datetime(2026, 9, 30, 9, 10, 8, tzinfo=kst)) > 10
+    # A delayed special session is measured from its own open (10:00).
+    assert hc.session_age_minutes(
+        datetime(2026, 1, 2, 10, 3, tzinfo=kst)
+    ) == pytest.approx(3)
+    # No session, no age: before the open, after the close, on a holiday.
+    assert hc.session_age_minutes(datetime(2026, 9, 30, 8, 59, tzinfo=kst)) is None
+    assert hc.session_age_minutes(datetime(2026, 9, 30, 15, 31, tzinfo=kst)) is None
+    assert hc.session_age_minutes(datetime(2026, 10, 5, 9, 0, 8, tzinfo=kst)) is None
+
+
 # --- spam suppression / state machine ------------------------------------
 
 
-def _run_main(monkeypatch, argv, posts):
+def _run_main(monkeypatch, argv, posts, *, session_age=60.0):
     monkeypatch.setattr(sys, "argv", ["watcher_health_check", *argv])
     monkeypatch.setattr(hc, "_post_discord",
                         lambda t, d, c: posts.append((t, d, c)))
-    # Always treat as in-session so tests don't depend on wall-clock.
+    # Always treat as in-session so tests don't depend on wall-clock — and
+    # as mid-session unless a test is about the open.
     monkeypatch.setattr(hc, "is_krx_regular_session_open", lambda now: True)
+    monkeypatch.setattr(hc, "session_age_minutes", lambda now: session_age)
     return hc.main()
 
 
@@ -188,6 +258,36 @@ def test_recovery_posts_all_clear_once(monkeypatch):
     posts.clear()
     _run_main(monkeypatch, [], posts)
     assert posts == []
+
+
+def test_run_at_the_open_neither_pages_nor_sends_the_all_clear(monkeypatch):
+    # An alert from yesterday afternoon is still open, and the watcher
+    # answers /health with yesterday's tick. That is not evidence of a stuck
+    # loop this early — and not evidence of a recovery either.
+    _stub_endpoints(monkeypatch, health={"status": "ok"},
+                    state={"last_tick_at": _iso(1050), "cycle_count": 733})
+    before = json.dumps({
+        "alerting": True,
+        "last_alert_at": (datetime.now(hc.KST) - timedelta(hours=18)).isoformat(),
+    })
+    hc.STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    hc.STATE_PATH.write_text(before)
+
+    posts = []
+    assert _run_main(monkeypatch, [], posts, session_age=_AT_THE_OPEN) == 0
+    assert posts == []
+    assert hc.STATE_PATH.read_text() == before
+
+    # Ten minutes in the same stale tick is a stuck loop, and it pages.
+    assert _run_main(monkeypatch, [], posts, session_age=10.0) == 0
+    assert len(posts) == 1 and "Watcher 이상" in posts[0][0]
+
+
+def test_run_at_the_open_still_pages_when_the_watcher_is_down(monkeypatch):
+    _stub_endpoints(monkeypatch, health=None, state=None)
+    posts = []
+    _run_main(monkeypatch, [], posts, session_age=_AT_THE_OPEN)
+    assert len(posts) == 1 and "Watcher 이상" in posts[0][0]
 
 
 def test_off_session_skips_entirely(monkeypatch):
