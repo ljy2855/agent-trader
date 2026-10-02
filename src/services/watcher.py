@@ -556,6 +556,13 @@ class IntradayWatcher:
         self._warned_loss_source_unverified = False
         self._prev_holdings: dict[str, dict[str, Any]] = {}
         self._intraday_high: dict[str, float] = {}
+        # KST date the highs above belong to. They are an intraday anchor —
+        # the high-drop trigger is documented as a pullback from the day's
+        # high — but nothing ever cleared them: a process up for days measured
+        # today's price against the high since it started, so whether the
+        # evaluator got asked depended on when the pod last restarted, and a
+        # name sold and bought back inherited the old position's peak.
+        self._intraday_high_day: str | None = None
         self._prev_regime: dict[str, Any] | None = None
         # Last regime label that we already announced as a flip — used as
         # the baseline for the next debounced flip detection.
@@ -1121,8 +1128,12 @@ class IntradayWatcher:
             await self._handle_trigger(event, planner_result={"holdings": enriched})
 
     def _enrich_holdings(self, holdings: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Track intraday high per holding so high-drop triggers work."""
+        """Track each holding's high for the current KST day so high-drop triggers work."""
 
+        day = (self._last_tick_at or datetime.now(KST)).astimezone(KST).date().isoformat()
+        if day != self._intraday_high_day:
+            self._intraday_high.clear()
+            self._intraday_high_day = day
         out: list[dict[str, Any]] = []
         for raw in holdings:
             if not isinstance(raw, dict):

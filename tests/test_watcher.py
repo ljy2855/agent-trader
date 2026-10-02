@@ -6313,3 +6313,32 @@ def test_loop_ticks_at_the_open_after_an_off_hours_restart(tmp_path):
     assert ticks == [datetime(2026, 9, 30, 9, 0, tzinfo=KST)]
     off_hours = sleeps[:-1]  # the last one is the poll interval after the tick
     assert max(off_hours) == 600 and off_hours[-1] == 263
+
+
+# -- intraday high: a per-day anchor ----------------------------------------
+
+
+def test_intraday_high_starts_over_each_trading_day():
+    w = _build_watcher()
+    held = {"stock_code": "373220", "current_price": 369_000}
+
+    w._last_tick_at = datetime(2026, 10, 1, 14, 0, tzinfo=KST)
+    w._enrich_holdings([held])
+
+    # Next morning, 2.4% under yesterday's high. Measured against yesterday
+    # this read as a 2% pullback and asked the evaluator at the open.
+    w._last_tick_at = datetime(2026, 10, 2, 9, 0, tzinfo=KST)
+    [today] = w._enrich_holdings([{**held, "current_price": 360_000}])
+    assert today["intraday_high"] == 360_000
+    assert watcher_module.triggers.detect_tier2_holding_swings(
+        [today], {}, swing_pct=2.5, high_drop_pct=2.0
+    ) == []
+
+    # Within the day the high still ratchets, and a pullback from it fires.
+    w._last_tick_at = datetime(2026, 10, 2, 11, 0, tzinfo=KST)
+    [later] = w._enrich_holdings([{**held, "current_price": 352_000}])
+    assert later["intraday_high"] == 360_000
+    [event] = watcher_module.triggers.detect_tier2_holding_swings(
+        [later], {}, swing_pct=2.5, high_drop_pct=2.0
+    )
+    assert "고점 이탈" in event.reason
