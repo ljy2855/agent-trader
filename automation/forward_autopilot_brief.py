@@ -54,6 +54,16 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+# automation/ lands on sys.path[0], not the repo root — same shim as
+# daily_ops_digest.py so `src.services` is importable.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+try:
+    from src.services.krx_calendar import DAY_CLOSED, krx_day_status
+except Exception:  # pragma: no cover - import fallback
+    krx_day_status = None  # type: ignore[assignment]
+    DAY_CLOSED = "closed"
+
 KST = timezone(timedelta(hours=9))
 # Digit-aware: TIER1/TIER2 carry a trailing digit, so `[A-Z_]+` would
 # truncate them to "TIER". Used for both Discord forwarding and the
@@ -79,6 +89,22 @@ WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 def _today_kst() -> str:
     return datetime.now(KST).strftime("%Y-%m-%d")
+
+
+def _krx_closure_today() -> str | None:
+    """Why the exchange is shut today, or None when it is (or may be) open.
+
+    The CronJob runs on a weekday cron that cannot see the exchange calendar.
+    On a holiday there is no brief to forward — `autopilot_calendar_gate.py`
+    does not fire the autopilots then — and the not-found fallback below would
+    post a red "the autopilot failed" embed for a market that never opened.
+    An uncertain calendar day is not a closure: the session may still run.
+    """
+
+    if krx_day_status is None:
+        return None
+    status = krx_day_status(datetime.now(KST).date())
+    return status.reason if status.state == DAY_CLOSED else None
 
 
 def _err(msg: str) -> None:
@@ -475,6 +501,13 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
+
+    closure = _krx_closure_today()
+    if closure:
+        # The cleanup waits too: closing yesterday's issues wakes their parent
+        # issue's squad leader, which is a PM run spent on a closed market.
+        print(f"[forward_autopilot_brief] {_today_kst()} KRX 휴장({closure}) — 전달·정리 생략")
+        return 0
 
     issue_id: str | None = None
     issue_title: str = "?"
