@@ -260,6 +260,83 @@ async def get_daily_realized_profit_by_stock(
     )
 
 
+async def get_period_realized_profit(
+    client: KiwoomClient,
+    start_date: str,
+    end_date: str,
+    max_requests: int = 10,
+) -> dict[str, Any]:
+    """Get realized P&L per sell over a period (`ka10073`).
+
+    One row per execution day and stock (`dt`, `stk_cd`, `cntr_qty`,
+    `buy_uv`, `cntr_pric`, `pl_rt`). `tdy_sel_pl` is already net of the
+    round trip's commission and the sell tax: one share bought at 70,000 and
+    sold at 68,000 reads -2,196 = -2,000 - 60 (both commissions) - 136 (tax),
+    checked against live rows on 2026-10-14. The broker answers only up to
+    three months before ``end_date``.
+
+    `ka10072` (`get_daily_realized_profit_by_stock`) looks like the same
+    thing but answers for ``strt_dt`` alone; the dashboard used it for a
+    period and showed the first day's sells only.
+    """
+
+    return await _run_account_query(
+        client,
+        api_info=ACCOUNT_APIS["ka10073"],
+        request_data={"strt_dt": start_date, "end_dt": end_date},
+        context={"start_date": start_date, "end_date": end_date},
+        result_key="realized_profit_data",
+        extractor=_list_from_key("dt_stk_rlzt_pl"),
+        max_requests=max_requests,
+        exception_message="Period realized profit endpoint not yet implemented or failed to connect",
+    )
+
+
+async def get_trade_history(
+    client: KiwoomClient,
+    start_date: str,
+    end_date: str,
+    tp: str = "3",
+    gds_tp: str = "1",
+    max_requests: int = 10,
+) -> dict[str, Any]:
+    """Get account transactions over a period (`kt00015` 위탁종합거래내역).
+
+    Buys and sells both appear (`io_tp_nm`), with quantity, unit price,
+    amount and `tax_sum_cmsn`. The date range selects the *settlement* day
+    `trde_dt`; the execution day is `cntr_dt`, two sessions earlier. A
+    trade therefore appears only once it has settled -- the settlement batch
+    runs around 01:10 KST -- so the last two sessions are missing.
+
+    Args:
+        tp: 0=전체(입출금 포함), 3=매매, 4=매수, 5=매도
+        gds_tp: 0=전체, 1=국내주식
+    """
+
+    # The exact body the live endpoint answered on 2026-10-14. The repo's
+    # spec table lists `end_dt` but not `strt_dt`; the broker takes both.
+    request_data = {
+        "strt_dt": start_date,
+        "end_dt": end_date,
+        "tp": tp,
+        "stk_cd": "",
+        "crnc_cd": "",
+        "gds_tp": gds_tp,
+        "frgn_stex_code": "",
+        "dmst_stex_tp": "%",
+    }
+    return await _run_account_query(
+        client,
+        api_info=ACCOUNT_APIS["kt00015"],
+        request_data=request_data,
+        context={"start_date": start_date, "end_date": end_date, "tp": tp, "gds_tp": gds_tp},
+        result_key="trade_history_data",
+        extractor=_list_from_key("trst_ovrl_trde_prps_array"),
+        max_requests=max_requests,
+        exception_message="Trade history endpoint not yet implemented or failed to connect",
+    )
+
+
 async def get_account_evaluation(
     client: KiwoomClient,
     qry_tp: str = "0",
@@ -538,19 +615,29 @@ async def get_daily_trading_journal(
     ottks_tp: str = "2",
     ch_crd_tp: str = "0",
     max_requests: int = 10,
+    base_dt: str = "",
 ) -> dict[str, Any]:
-    """Get today's trading journal (당일매매일지) using Kiwoom's `ka10170`.
+    """Get a day's trading journal (당일매매일지) using Kiwoom's `ka10170`.
+
+    One row per stock with that day's buy and sell legs; buy-only days are
+    included. A day without trades comes back as a single row of empty
+    strings, not as an empty list.
 
     Args:
         ottks_tp: 단주구분. 1=당일매수에 대한 당일매도, 2=당일매도 전체
         ch_crd_tp: 현금신용구분. 0=전체, 1=현금매매만, 2=신용매매만
+        base_dt: YYYYMMDD, up to two months back. Empty means today and
+            leaves the field out of the request, as before.
     """
 
+    request_data = {"ottks_tp": ottks_tp, "ch_crd_tp": ch_crd_tp}
+    if base_dt:
+        request_data["base_dt"] = base_dt
     return await _run_account_query(
         client,
         api_info=ACCOUNT_APIS.daily_trading_journal,
-        request_data={"ottks_tp": ottks_tp, "ch_crd_tp": ch_crd_tp},
-        context={"ottks_tp": ottks_tp, "ch_crd_tp": ch_crd_tp},
+        request_data=request_data,
+        context={"ottks_tp": ottks_tp, "ch_crd_tp": ch_crd_tp, "base_dt": base_dt},
         result_key="trading_journal_data",
         extractor=_list_from_key("tdy_trde_diary"),
         max_requests=max_requests,
@@ -560,6 +647,8 @@ async def get_daily_trading_journal(
 
 __all__ = [
     "get_daily_realized_profit_by_stock",
+    "get_period_realized_profit",
+    "get_trade_history",
     "get_daily_trading_journal",
     "get_account_evaluation",
     "get_daily_estimated_asset",

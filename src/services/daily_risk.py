@@ -116,19 +116,19 @@ there would be a derivation, not a reading.
 
 **Documented limits of this adapter:**
 
-1. ``tdy_lspft``/``tdy_lspft_rt`` have never been read by this repository
-   before (no fixture, no live sample). The field *names* come from the
-   spec, not from an observed payload. Until an enabled breaker has been
-   watched against a live account for a session, treat its numbers as
-   unverified.
+1. The field *names* come from the spec. The one live sample so far
+   (2026-10-14 00:50 KST, before the open) read 0 for every P&L field here,
+   ``tdy_lspft`` included, so whether they fill in during a session is
+   still open. Until an enabled breaker has been watched against a live
+   account for a session, treat its numbers as unverified.
 2. Whether ``tdy_lspft`` is realized-only or realized + unrealized, and
    whether it is net of commission and tax, is not stated in the spec. The
    breaker therefore treats it as an opaque "today's P&L" scalar and never
    tries to decompose it.
-3. ``src/dashboard.py`` currently labels ``tdy_lspft_amt`` as today's P&L
-   and prefers ``lspft_ratio`` (a *monthly* rate) for a daily figure. Per
-   the table above both look wrong. That is out of scope here and was left
-   alone — this module does not reuse the dashboard's mapping.
+3. ``src/dashboard.py`` labelled ``tdy_lspft_amt`` as today's P&L and
+   ``lspft_ratio`` (a *monthly* rate) as the total rate until 2026-10-14; it
+   now reads ``tdy_lspft`` and ``lspft_rt`` by the table above. This module
+   still does not reuse the dashboard's mapping.
 4. The percentage is computed against total account assets rather than the
    broker's own ``tdy_lspft_rt``; see :func:`AccountDailySnapshot.loss_pct`.
 """

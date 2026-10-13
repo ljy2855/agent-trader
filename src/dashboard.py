@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import calendar
 import json
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo
 
@@ -17,7 +18,7 @@ from starlette.routing import Route
 from .agent_overview import build_agent_overview
 from .config import Settings, get_settings
 from .dashboard_template import DASHBOARD_HTML
-from .services import account, benchmark, market
+from .services import account, benchmark, krx_calendar, market
 from .services.kiwoom_client import KiwoomClient
 
 KST = ZoneInfo("Asia/Seoul")
@@ -235,6 +236,206 @@ def _build_asset_series(asset_series_result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _annotate_asset_sessions(
+    points: list[dict[str, Any]],
+    index_bars: list[dict[str, Any]],
+    excluded_days: list[dict[str, Any]],
+) -> None:
+    """Mark trading days and each one's change from the previous session.
+
+    kt00002 returns every calendar day, so weekends and holidays sit in the
+    series as copies of the last close: 60 days held about 40 sessions and
+    the chart read as a flat line with a few steps. The index bars fetched
+    for the benchmark are exactly the exchange's sessions, so they decide
+    which points count. Outside the bars' range (today before the index row
+    exists, or no index data at all) a weekday stands in.
+
+    `flow_suspect` carries the benchmark's excluded days -- moves too large
+    for the trades to explain, which on this account means a deposit or a
+    withdrawal -- so the chart can show them apart from trading days.
+    """
+
+    sessions = set(benchmark.index_series(index_bars))
+    first_session = min(sessions) if sessions else None
+    last_session = max(sessions) if sessions else None
+    flows = {
+        str(row.get("date"))
+        for row in excluded_days or []
+        if isinstance(row, dict) and row.get("date")
+    }
+    previous: int | None = None
+    for point in points:
+        day = point["date"]
+        if first_session is not None and first_session <= day <= last_session:
+            trading = day in sessions
+        else:
+            trading = datetime.strptime(day, "%Y-%m-%d").weekday() < 5
+        point["trading_day"] = trading
+        if not trading:
+            continue
+        if previous is not None:
+            change = point["value"] - previous
+            point["day_change"] = change
+            point["day_change_pct"] = round(change / previous * 100, 2) if previous else None
+        if day in flows:
+            point["flow_suspect"] = True
+        previous = point["value"]
+
+
+# kt00015 books a trade on its settlement day, two sessions after the fill,
+# in a batch around 01:10 KST. The last three sessions up to today are read
+# from the day journal (ka10170) instead -- three, not two, so T-2 is covered
+# before that batch has run.
+RECENT_JOURNAL_SESSIONS = 3
+
+
+def _ymd(day: date) -> str:
+    return day.strftime("%Y%m%d")
+
+
+def _parse_ymd(value: str) -> date:
+    return datetime.strptime(value, "%Y%m%d").date()
+
+
+def _code6(value: Any) -> str:
+    """`A005930` (kt00004, kt00015) and `005930` (ka10073, ka10170) alike."""
+
+    text = str(value or "").strip()
+    if len(text) == 7 and text[0] == "A" and text[1:].isdigit():
+        return text[1:]
+    return text
+
+
+def _stock_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop the all-empty row ka10170 sends for a day without trades."""
+
+    return [row for row in rows if _code6(row.get("stk_cd")) or str(row.get("stk_nm") or "").strip()]
+
+
+def _recent_sessions(today: str, start: str, end: str) -> list[str]:
+    """The last sessions up to ``today`` that fall inside [start, end].
+
+    A weekday the calendar cannot rule out (an unsupported year) counts as
+    a session: asking the journal for a closed day only returns an empty row.
+    """
+
+    day = _parse_ymd(today)
+    found: list[str] = []
+    for _ in range(15):  # enough to cross the longest holiday run
+        if len(found) == RECENT_JOURNAL_SESSIONS:
+            break
+        if krx_calendar.krx_day_status(day).state != krx_calendar.DAY_CLOSED:
+            found.append(_ymd(day))
+        day -= timedelta(days=1)
+    return [d for d in found if start <= d <= end]
+
+
+def _realized_window_start(start: str, end: str) -> str:
+    """Clamp ``start`` to the three months ka10073 answers before ``end``."""
+
+    last = _parse_ymd(end)
+    year, month = (last.year, last.month - 3) if last.month > 3 else (last.year - 1, last.month + 9)
+    floor = date(year, month, min(last.day, calendar.monthrange(year, month)[1])) + timedelta(days=1)
+    return max(start, _ymd(floor))
+
+
+def _build_trade_history(
+    settled_rows: list[dict[str, Any]],
+    journals: dict[str, list[dict[str, Any]]],
+    realized_rows: list[dict[str, Any]],
+    start: str,
+    end: str,
+) -> list[dict[str, Any]]:
+    """Buys and sells by execution day, newest first.
+
+    Until 2026-10-14 the dashboard's trade list was ka10076, which only
+    knows today's fills, so a month of trading showed as an empty table.
+    Settled trades come from kt00015 by `cntr_dt`. The days in ``journals``
+    (recent sessions kt00015 may not have booked yet) come from ka10170 and
+    replace whatever kt00015 holds for them. Sells carry the realized P&L
+    ka10073 reports for the same day and stock, which nets the whole round
+    trip's costs; the journal's own `pl_amt` leaves out the buy commission.
+    """
+
+    realized: dict[tuple[str, str], tuple[int, Any]] = {}
+    for row in realized_rows:
+        key = (str(row.get("dt") or ""), _code6(row.get("stk_cd")))
+        pl = _to_int(row.get("tdy_sel_pl"))
+        if pl is None:
+            continue
+        previous = realized.get(key)
+        realized[key] = ((previous[0] if previous else 0) + pl, row.get("pl_rt") or "")
+
+    trades: list[dict[str, Any]] = []
+
+    def add(day: str, side: str, row: dict[str, Any], quantity: Any, price: Any,
+            amount: Any, fee: Any, profit: Any = None, rate: Any = "") -> None:
+        code = _code6(row.get("stk_cd"))
+        if side == "매도" and (day, code) in realized:
+            profit, rate = realized[(day, code)]
+        trades.append({
+            "trade_date": day,
+            "side": side,
+            "stock_name": str(row.get("stk_nm") or "").strip(),
+            "stock_code": code,
+            "quantity": _to_int(quantity),
+            "price": _to_int(price),
+            "amount": _to_int(amount),
+            "fee_tax": _to_int(fee),
+            "profit_loss": _to_int(profit) if side == "매도" else None,
+            "profit_rate": rate if side == "매도" else "",
+        })
+
+    for row in settled_rows:
+        day = str(row.get("cntr_dt") or row.get("trde_dt") or "")
+        side = str(row.get("io_tp_nm") or "").strip()
+        if not (start <= day <= end) or day in journals or side not in ("매수", "매도"):
+            continue
+        add(day, side, row, row.get("trde_qty_jwa_cnt"), row.get("trde_unit"),
+            row.get("trde_amt"), row.get("tax_sum_cmsn"))
+
+    for day, rows in journals.items():
+        for row in _stock_rows(rows):
+            bought = _to_int(row.get("buy_qty")) or 0
+            sold = _to_int(row.get("sell_qty")) or 0
+            # One fee per stock-day; with both legs it goes to the sell,
+            # which carries the tax.
+            fee = row.get("cmsn_alm_tax")
+            if bought > 0:
+                add(day, "매수", row, bought, row.get("buy_avg_pric"), row.get("buy_amt"),
+                    None if sold > 0 else fee)
+            if sold > 0:
+                add(day, "매도", row, sold, row.get("sel_avg_pric"), row.get("sell_amt"), fee,
+                    row.get("pl_amt"), row.get("prft_rt") or "")
+
+    # Neither source has a fill time. Buys list above sells within a day:
+    # closing-auction entries are usually the day's last fill.
+    trades.sort(key=lambda t: (t["trade_date"], t["side"] == "매수"), reverse=True)
+    return trades
+
+
+def _realized_table_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """ka10073 rows in the realized-P&L table's shape, newest first."""
+
+    table: list[dict[str, Any]] = []
+    for row in rows:
+        commission = _to_int(row.get("tdy_trde_cmsn"))
+        tax = _to_int(row.get("tdy_trde_tax"))
+        table.append({
+            "trade_date": str(row.get("dt") or ""),
+            "stock_name": str(row.get("stk_nm") or "").strip(),
+            "stock_code": _code6(row.get("stk_cd")),
+            "quantity": _to_int(row.get("cntr_qty")),
+            "buy_price": _to_int(row.get("buy_uv")),
+            "sell_price": _to_int(row.get("cntr_pric")),
+            "fee_tax": None if commission is None and tax is None else (commission or 0) + (tax or 0),
+            "profit_loss": _to_int(row.get("tdy_sel_pl")),
+            "profit_rate": row.get("pl_rt") or "",
+        })
+    table.sort(key=lambda r: r["trade_date"], reverse=True)
+    return table
+
+
 async def build_dashboard_snapshot(
     client: KiwoomClient,
     settings: Settings,
@@ -245,6 +446,17 @@ async def build_dashboard_snapshot(
 
     # Total-asset chart spans a wider window than the trade tables.
     asset_series_start = _default_start_date(60)
+    today = _today_ymd()
+    trades_end = min(end_date, today)
+    # Both trade tables cover at most the three months ka10073 answers. For
+    # kt00015 the cap is about volume: it pages 20 rows at a time, April had
+    # 100+ fills on one settlement day, and back-to-back pages draw 429
+    # (2026-10-14, 4/1~10/14).
+    trades_start = _realized_window_start(start_date, trades_end)
+    # Fills up to `end_date` settle (and reach kt00015) up to a few days later.
+    history_end = min(today, _ymd(_parse_ymd(end_date) + timedelta(days=10)))
+    recent_sessions = _recent_sessions(today, trades_start, end_date)
+    journal_days = [day for day in recent_sessions if day != today]
 
     (
         evaluation_result,
@@ -257,11 +469,13 @@ async def build_dashboard_snapshot(
         unexecuted_result,
         asset_series_result,
         index_bars_result,
+        trade_history_result,
+        *journal_results,
     ) = await asyncio.gather(
         account.get_account_evaluation(client),
         account.get_account_current_status(client),
         account.get_daily_account_profit_detail(client, start_date, end_date),
-        account.get_daily_realized_profit_by_stock(client, "", start_date),
+        account.get_period_realized_profit(client, trades_start, trades_end),
         account.get_daily_trading_journal(client),
         account.get_execution_info(client, "0", "0", "1"),
         account.get_order_execution_status(client, "1", "0", "0", "0", "KRX"),
@@ -271,6 +485,8 @@ async def build_dashboard_snapshot(
         # comparison needs never paginates. `inds_cd` is required — omitting
         # it is answered with 1511, the same shape as the ka10075 outage.
         market.get_index_daily_bars(client, inds_cd="001", base_date=end_date),
+        account.get_trade_history(client, trades_start, history_end),
+        *(account.get_daily_trading_journal(client, base_dt=day) for day in journal_days),
     )
 
     evaluation_record = _first_record(evaluation_result, "evaluation_data")
@@ -278,16 +494,39 @@ async def build_dashboard_snapshot(
     profit_detail_record = _first_record(profit_detail_result, "profit_detail_data")
     profit_detail_rows = _records(profit_detail_result, "profit_detail_data")
     execution_rows = _records(execution_result, "execution_data")
-    realized_profit_rows = _records(realized_profit_result, "realized_profit_data")
-    trading_journal_rows = _records(trading_journal_result, "trading_journal_data")
+    realized_profit_rows = _stock_rows(_records(realized_profit_result, "realized_profit_data"))
+    trading_journal_rows = _stock_rows(_records(trading_journal_result, "trading_journal_data"))
     unexecuted_rows = _records(unexecuted_result, "unexecuted_orders_data")
 
+    # A journal day replaces kt00015's rows for that day, so only a journal
+    # that answered may do so; otherwise kt00015 keeps the day.
+    journals = {
+        day: _records(result, "trading_journal_data")
+        for day, result in zip(journal_days, journal_results)
+        if result.get("success")
+    }
+    if today in recent_sessions and trading_journal_result.get("success"):
+        journals[today] = _records(trading_journal_result, "trading_journal_data")
+    trade_history = _build_trade_history(
+        _records(trade_history_result, "trade_history_data"),
+        journals,
+        realized_profit_rows,
+        trades_start,
+        end_date,
+    )
+
     asset_series = _build_asset_series(asset_series_result)
+    index_bars = _records(index_bars_result, "index_daily_bars")
     # Same points the chart draws, measured against the index over the same
     # days. Until 2026-09-21 nothing here compared the account to anything.
     benchmark_summary = benchmark.build_comparison(
         asset_series.get("points") or [],
-        _records(index_bars_result, "index_daily_bars"),
+        index_bars,
+    )
+    _annotate_asset_sessions(
+        asset_series.get("points") or [],
+        index_bars,
+        benchmark_summary.get("excluded_days") or [],
     )
 
     holdings_rows: list[dict[str, Any]] = []
@@ -303,7 +542,7 @@ async def build_dashboard_snapshot(
     if not order_status_rows:
         order_status_rows = order_status_summary_rows
 
-    # Compute "예수금 + 보유 종목 평가금액" explicitly so the user always sees
+    # Compute "현금 + 보유 종목 평가금액" explicitly so the user always sees
     # one consolidated figure regardless of Kiwoom's settlement-state quirks
     # in `prsm_dpst_aset_amt` / `aset_evlt_amt`.
     cash_value = _pick_first(
@@ -316,18 +555,29 @@ async def build_dashboard_snapshot(
         n = _to_int(amount)
         if n is not None:
             holdings_eval_int += n
-    total_combined = cash_int + holdings_eval_int
+    # The cash leg is D+2 추정예수금, not today's 예수금 `entr`: `entr` has not
+    # seen fills that are still settling, so for two sessions after a sale
+    # the proceeds were missing from the total (about a fifth of the account
+    # on 2026-10-14) and after a buy the cost was counted twice.
+    settled_cash_int = _to_int(
+        _pick_first(current_status_record, "d2_entra", "d2_est_dpst")
+        or _pick_first(evaluation_record, "d2_entra")
+    )
+    cash_label = "D+2 예수금"
+    if settled_cash_int is None:
+        settled_cash_int, cash_label = cash_int, "예수금"
+    total_combined = settled_cash_int + holdings_eval_int
 
     summary = [
         {
-            "label": "총 자산 (예수금+보유평가)",
-            "value": str(total_combined) if (cash_int or holdings_eval_int) else "",
+            "label": "총 자산 (D+2 예수금+보유평가)",
+            "value": str(total_combined) if (settled_cash_int or holdings_eval_int) else "",
             "kind": "currency",
             "tone": "neutral",
             "highlight": True,
             "detail": (
-                f"예수금 {cash_int:,}원 + 보유 평가 {holdings_eval_int:,}원"
-                if (cash_int or holdings_eval_int) else ""
+                f"{cash_label} {settled_cash_int:,}원 + 보유 평가 {holdings_eval_int:,}원"
+                if (settled_cash_int or holdings_eval_int) else ""
             ),
         },
         {
@@ -358,17 +608,29 @@ async def build_dashboard_snapshot(
             "kind": "currency",
             "tone": "neutral",
         },
+        # kt00004's own P&L fields, by their spec names (daily_risk.py has
+        # the table). These cards read `tdy_lspft_amt` (당일투자원금, a
+        # principal) as today's P&L and `lspft_ratio` (당월손익율) as the
+        # total rate. What `tdy_lspft` counts is still unverified.
         {
-            "label": "당일 손익",
-            "value": _pick_first(evaluation_record, "tdy_lspft_amt"),
+            "label": "당일 손익 (Kiwoom)",
+            "value": _pick_first(evaluation_record, "tdy_lspft"),
             "kind": "currency",
-            "tone": _tone_for_value(_pick_first(evaluation_record, "tdy_lspft_amt")),
+            "tone": _tone_for_value(_pick_first(evaluation_record, "tdy_lspft")),
+            "detail": (
+                f"당일손익율 {_pick_first(evaluation_record, 'tdy_lspft_rt')}%"
+                if _pick_first(evaluation_record, "tdy_lspft_rt") else ""
+            ),
         },
         {
-            "label": "총 손익률",
-            "value": _pick_first(evaluation_record, "lspft_ratio", "lspft_rt", "tdy_lspft_rt"),
+            "label": "누적 손익률 (Kiwoom)",
+            "value": _pick_first(evaluation_record, "lspft_rt"),
             "kind": "ratio",
-            "tone": _tone_for_value(_pick_first(evaluation_record, "lspft_amt", "tdy_lspft_amt")),
+            "tone": _tone_for_value(_pick_first(evaluation_record, "lspft")),
+            "detail": (
+                f"누적 투자손익 {_to_int(_pick_first(evaluation_record, 'lspft')):,}원"
+                if _to_int(_pick_first(evaluation_record, "lspft")) is not None else ""
+            ),
         },
     ]
 
@@ -390,6 +652,8 @@ async def build_dashboard_snapshot(
         # A silent index failure would make the benchmark quietly vanish
         # rather than say why, so it gets a source row like every other leg.
         ("KOSPI 일봉 (벤치마크)", index_bars_result),
+        ("매매 이력 (결제분)", trade_history_result),
+        *((f"매매일지 {day[4:6]}/{day[6:]}", result) for day, result in zip(journal_days, journal_results)),
     ]:
         status, status_label = _source_status(result)
         sources.append(
@@ -474,26 +738,34 @@ async def build_dashboard_snapshot(
         "order_no": ["ord_no", "orig_ord_no"],
     }
 
-    realized_columns = [
-        {"key": "trade_date", "label": "일자"},
+    trade_history_columns = [
+        {"key": "trade_date", "label": "체결일"},
+        {"key": "side", "label": "구분"},
         {"key": "stock_name", "label": "종목"},
         {"key": "stock_code", "label": "코드"},
         {"key": "quantity", "label": "수량"},
-        {"key": "buy_amount", "label": "매입금액"},
-        {"key": "sell_amount", "label": "매도금액"},
+        {"key": "price", "label": "단가"},
+        {"key": "amount", "label": "금액"},
+        {"key": "fee_tax", "label": "수수료·세금"},
         {"key": "profit_loss", "label": "실현손익"},
         {"key": "profit_rate", "label": "수익률"},
     ]
-    realized_aliases = {
-        "trade_date": ["dt", "trde_dt", "ord_dt"],
-        "stock_name": ["stk_nm", "item_nm", "name"],
-        "stock_code": ["stk_cd", "code"],
-        "quantity": ["qty", "sel_qty", "trde_qty"],
-        "buy_amount": ["pur_amt", "buy_amt", "maeip_amt"],
-        "sell_amount": ["sel_amt", "sell_amt", "maedo_amt"],
-        "profit_loss": ["rlzt_pl", "lspft_amt", "pl_amt"],
-        "profit_rate": ["rlzt_rt", "lspft_rt", "pl_rt"],
-    }
+
+    realized_columns = [
+        {"key": "trade_date", "label": "매도일"},
+        {"key": "stock_name", "label": "종목"},
+        {"key": "stock_code", "label": "코드"},
+        {"key": "quantity", "label": "수량"},
+        {"key": "buy_price", "label": "매입단가"},
+        {"key": "sell_price", "label": "매도가"},
+        {"key": "fee_tax", "label": "수수료·세금"},
+        {"key": "profit_loss", "label": "실현손익"},
+        {"key": "profit_rate", "label": "수익률"},
+    ]
+    trades_since = (
+        f"{trades_start[4:6]}/{trades_start[6:]}부터" if trades_start > start_date else ""
+    )
+    trades_note = f"{trades_since} (최근 3개월)" if trades_since else ""
 
     trading_journal_columns = [
         {"key": "stock_name", "label": "종목"},
@@ -546,6 +818,7 @@ async def build_dashboard_snapshot(
         "active_orders_count": len(unexecuted_rows),
         "order_status_count": len(order_status_rows),
         "executions_count": len(execution_rows),
+        "trade_history_count": len(trade_history),
         "realized_trades_count": len(realized_profit_rows),
         "issues_count": len(sources_with_issues),
         "empty_sources_count": len(empty_sources),
@@ -557,22 +830,53 @@ async def build_dashboard_snapshot(
     )
     period_start_value = _to_int(period_start_raw)
     period_current_value = _to_int(period_current_raw)
-    if period_start_value is not None and period_current_value is not None:
-        period_profit_value: Any = period_current_value - period_start_value
-        if period_start_value != 0:
-            period_rate_value: Any = round(
-                (period_current_value - period_start_value) / period_start_value * 100,
-                2,
+    # kt00016 nets deposits and withdrawals out of `evltv_prft` and rates it
+    # on the average invested principal (`prft_rt`). The end-minus-start
+    # asset difference counts a withdrawal as a loss: a half year with one
+    # large withdrawal read as a deep loss where Kiwoom reported a gain (10/9).
+    broker_profit = _to_int(_pick_first(profit_detail_record, "evltv_prft"))
+    try:
+        broker_rate: float | None = round(
+            float(str(_pick_first(profit_detail_record, "prft_rt")).replace(",", "")), 2
+        )
+    except ValueError:
+        broker_rate = None
+    # Until the end date has closed, kt00016 has no row for it: every `*_to`
+    # field reads 0 and `evltv_prft` is minus the starting assets, -100%.
+    # With the default end date of today that was the dashboard's state for
+    # the whole day (2026-10-14). The flow totals are still filled in then.
+    broker_closed = bool(_to_int(_pick_first(profit_detail_record, "tot_amt_to")))
+    deposits = _to_int(_pick_first(profit_detail_record, "termin_tot_trns")) or 0
+    withdrawals = _to_int(_pick_first(profit_detail_record, "termin_tot_pymn")) or 0
+    flow_note = (
+        f"입금 {deposits:,}원 · 출금 {withdrawals:,}원 제외" if (deposits or withdrawals) else ""
+    )
+    period_flow_detail = flow_note
+    if broker_closed and broker_profit is not None and broker_rate is not None:
+        period_profit_value: Any = broker_profit
+        period_rate_value: Any = broker_rate
+    elif period_start_value is not None and period_current_value is not None:
+        # The same netting by hand, on today's estimated assets (kt00004).
+        period_profit_value = period_current_value - period_start_value - (deposits - withdrawals)
+        rate_base = _to_int(_pick_first(profit_detail_record, "invt_bsamt")) or period_start_value
+        period_rate_value = round(period_profit_value / rate_base * 100, 2) if rate_base else 0
+        if profit_detail_record and not broker_closed:
+            period_flow_detail = " · ".join(
+                part for part in (flow_note, "키움 기간 집계 전 — 현재 추정자산 기준") if part
             )
-        else:
-            period_rate_value = 0
-    else:
+    elif broker_closed:
+        # `tern_rt` is turnover (626% over the same window), not a return.
         period_profit_value = _pick_first(profit_detail_record, "evltv_prft", "lspft_amt")
-        period_rate_value = _pick_first(profit_detail_record, "prft_rt", "tern_rt")
+        period_rate_value = _pick_first(profit_detail_record, "prft_rt")
+    else:
+        period_profit_value = ""
+        period_rate_value = ""
 
     # Derived performance — works in mock where kt00016 (period profit) is
-    # unsupported. Combines today's journal (closed trades) + holdings
-    # unrealized P&L for a complete picture of "what happened this period".
+    # unsupported. Period sells (ka10073) + holdings unrealized P&L for a
+    # picture of "what happened this period". This read today's journal
+    # (ka10170) until 2026-10-14, so the card was empty on any day without
+    # a sell, whatever the period.
     realized_pl_int = 0
     commission_int = 0
     win_count = 0
@@ -580,21 +884,13 @@ async def build_dashboard_snapshot(
     closed_trade_count = 0
     biggest_winner = None  # (gain_int, name)
     biggest_loser = None
-    for row in trading_journal_rows:
-        sell_qty_int = _to_int(_pick_first(row, "sell_qty", "sel_qty")) or 0
-        if sell_qty_int <= 0:
-            # buy-only row (entry that hasn't closed yet); no realized P&L.
-            continue
-        closed_trade_count += 1
-        pl_int = _to_int(
-            _pick_first(row, "pl_amt", "tdy_sel_pl", "lspft_amt", "profit_loss")
-        )
+    for row in realized_profit_rows:
+        pl_int = _to_int(row.get("tdy_sel_pl"))
         if pl_int is None:
             continue
+        closed_trade_count += 1
         realized_pl_int += pl_int
-        cmsn = _to_int(_pick_first(row, "cmsn_alm_tax", "tdy_trde_cmsn"))
-        if cmsn is not None:
-            commission_int += cmsn
+        commission_int += (_to_int(row.get("tdy_trde_cmsn")) or 0) + (_to_int(row.get("tdy_trde_tax")) or 0)
         if pl_int > 0:
             win_count += 1
             if biggest_winner is None or pl_int > biggest_winner[0]:
@@ -613,14 +909,16 @@ async def build_dashboard_snapshot(
             unrealized_pl_int += upl
 
     total_pl_int = realized_pl_int + unrealized_pl_int
+    realized_ok = bool(realized_profit_result.get("success"))
     win_rate_value: Any = ""
     if win_count + loss_count > 0:
         win_rate_value = round(win_count / (win_count + loss_count) * 100, 1)
 
-    # Use cash+holdings combined as denominator for an apples-to-apples
-    # period return when the API-reported start-of-period asset is missing.
+    # The period's own starting assets (kt00016) first; cash+holdings is a
+    # today figure and, inside the T+2 window, counts a trade twice or not
+    # at all (roadmap), so it is only the fallback.
     pl_rate_value: Any = ""
-    asset_base = total_combined or period_start_value or 0
+    asset_base = period_start_value or total_combined or 0
     if asset_base:
         pl_rate_value = round(total_pl_int / asset_base * 100, 2)
 
@@ -642,6 +940,7 @@ async def build_dashboard_snapshot(
             "value": period_profit_value,
             "kind": "currency",
             "tone": _tone_for_value(period_profit_value),
+            "detail": period_flow_detail,
         },
         {
             "label": "기간 수익률 (Kiwoom)",
@@ -650,14 +949,18 @@ async def build_dashboard_snapshot(
             "tone": _tone_for_value(period_profit_value),
         },
         {
-            "label": "실현 손익 (체결완료)",
-            "value": str(realized_pl_int) if closed_trade_count else "",
+            "label": "실현 손익 (기간)",
+            # A period without a sell is 0, not missing; only a failed read is.
+            "value": str(realized_pl_int) if realized_ok else "",
             "kind": "currency",
             "tone": _tone_for_value(realized_pl_int),
-            "detail": (
-                f"매도 체결 {closed_trade_count}건 · 수수료/세금 {commission_int:,}원"
-                if closed_trade_count else ""
-            ),
+            "detail": " · ".join(
+                part for part in (
+                    f"매도 {closed_trade_count}건 · 수수료·세금 {commission_int:,}원"
+                    if closed_trade_count else "기간 중 매도 없음",
+                    trades_note,
+                ) if part
+            ) if realized_ok else "",
         },
         {
             "label": "미실현 손익 (보유 평가)",
@@ -668,14 +971,14 @@ async def build_dashboard_snapshot(
         },
         {
             "label": "종합 손익",
-            "value": str(total_pl_int) if (closed_trade_count or holdings_rows) else "",
+            "value": str(total_pl_int) if (realized_ok or holdings_rows) else "",
             "kind": "currency",
             "tone": _tone_for_value(total_pl_int),
             "highlight": True,
             "detail": (
-                f"실현 {realized_pl_int:+,} + 미실현 {unrealized_pl_int:+,} "
-                "(매매손익만 — 입출금 무관)"
-                if (closed_trade_count or holdings_rows) else ""
+                f"기간 실현 {realized_pl_int:+,}{f'({trades_since})' if trades_since else ''} "
+                f"+ 보유 평가 {unrealized_pl_int:+,} (매매손익만 — 입출금 무관)"
+                if (realized_ok or holdings_rows) else ""
             ),
         },
         {
@@ -775,13 +1078,28 @@ async def build_dashboard_snapshot(
                 raw_rows=execution_rows,
                 empty_message="체결 이력이 없습니다.",
             ),
-            "realized_profit": _table_payload(
-                title="실현손익",
-                columns=realized_columns,
-                rows=_normalize_rows(realized_profit_rows, realized_aliases),
-                raw_rows=realized_profit_rows,
-                empty_message="선택 기간의 실현손익이 없습니다.",
-            ),
+            "trade_history": {
+                **_table_payload(
+                    title="매매 이력",
+                    columns=trade_history_columns,
+                    rows=trade_history,
+                    raw_rows=trade_history,
+                    empty_message="선택 기간의 매매 내역이 없습니다.",
+                ),
+                "note": " · ".join(
+                    part for part in (trades_note, "최근 3거래일은 당일매매일지, 그 전은 결제 내역 기준") if part
+                ),
+            },
+            "realized_profit": {
+                **_table_payload(
+                    title="실현손익",
+                    columns=realized_columns,
+                    rows=_realized_table_rows(realized_profit_rows),
+                    raw_rows=realized_profit_rows,
+                    empty_message="선택 기간의 실현손익이 없습니다.",
+                ),
+                "note": trades_note,
+            },
             "trading_journal": _table_payload(
                 title="당일매매일지",
                 columns=trading_journal_columns,

@@ -650,6 +650,21 @@ DASHBOARD_HTML = r"""<!doctype html>
       gap: 14px;
     }
 
+    .activity-grid > .subpanel.wide {
+      grid-column: 1 / -1;
+    }
+
+    /* Same as .ag-stack: a grid item grows to its widest table unless told
+       otherwise, which pushed the trading tab to about 640px on a 390px
+       screen. Tables scroll inside their .table-wrap instead. */
+    .overview-grid > *,
+    .content-grid > *,
+    .activity-grid > *,
+    .diagnostics-body > *,
+    .hidden-grid > * {
+      min-width: 0;
+    }
+
     .subpanel {
       border: 1px solid rgba(24, 33, 47, 0.08);
       border-radius: var(--radius-lg);
@@ -840,6 +855,36 @@ DASHBOARD_HTML = r"""<!doctype html>
       background: var(--panel-strong); border: 1px solid var(--line); min-width: 0;
     }
     .ag-stat .k { font-size: 11px; color: var(--muted); letter-spacing: 0.04em; }
+    .asset-stats { margin-bottom: 14px; }
+    @media (max-width: 680px) {
+      .asset-head { flex-direction: column; align-items: flex-start; }
+    }
+    .asset-stats:empty { display: none; }
+    #asset-chart { position: relative; }
+    #asset-chart svg { display: block; touch-action: pan-y; }
+    .ac-grid { stroke: var(--line); stroke-width: 1; }
+    .ac-tick { fill: var(--muted); font-size: 11px; }
+    .ac-caption { fill: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: 0.04em; }
+    .ac-area { fill: var(--accent-soft); }
+    .ac-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; }
+    .ac-dot { fill: var(--accent); }
+    .ac-dot--last { stroke: var(--panel-strong); stroke-width: 2; }
+    .ac-zero { stroke: rgba(24, 33, 47, 0.28); stroke-width: 1; }
+    .ac-bar--up { fill: var(--positive); }
+    .ac-bar--down { fill: var(--negative); }
+    .ac-bar--flow { fill: rgba(95, 105, 121, 0.35); }
+    .ac-guide { stroke: rgba(24, 33, 47, 0.38); stroke-width: 1; stroke-dasharray: 3 3; }
+    .ac-focus { fill: var(--panel-strong); stroke: var(--accent); stroke-width: 2; }
+    .ac-tip {
+      position: absolute; top: 4px; z-index: 2; pointer-events: none;
+      padding: 8px 11px; border-radius: var(--radius-sm);
+      background: var(--panel-strong); border: 1px solid var(--line);
+      box-shadow: 0 8px 24px rgba(24, 33, 47, 0.12);
+      font-size: 12px; line-height: 1.55; white-space: nowrap;
+    }
+    .ac-tip .d { color: var(--muted); }
+    .ac-tip .v { font-size: 14px; font-weight: 700; }
+    .ac-tip .flow { color: var(--warning); }
     .ag-stat .v {
       font-size: 17px; font-weight: 700; margin-top: 4px;
       display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
@@ -1158,13 +1203,14 @@ DASHBOARD_HTML = r"""<!doctype html>
     </section>
 
     <section class="panel">
-      <div class="section-head">
+      <div class="section-head asset-head">
         <div>
           <p class="section-kicker">Assets</p>
           <h2>총자산 추이</h2>
         </div>
         <p class="section-subtitle" id="asset-chart-note">-</p>
       </div>
+      <div id="asset-stats" class="ag-strip asset-stats"></div>
       <div id="asset-chart"></div>
     </section>
 
@@ -1209,7 +1255,7 @@ DASHBOARD_HTML = r"""<!doctype html>
           <p class="section-kicker">Recent Activity</p>
           <h3>최근 거래 이력</h3>
         </div>
-        <p class="section-subtitle">체결과 실현손익만 분리해서 표시</p>
+        <p class="section-subtitle">기간 매매(매수·매도)와 실현손익</p>
       </div>
       <div id="activity-root"></div>
     </section>
@@ -1402,8 +1448,14 @@ DASHBOARD_HTML = r"""<!doctype html>
         return escapeHtml(formatMetric(value, "number"));
       }
 
-      if (key.includes("amount") || key.includes("price") || key.includes("profit") || key === "deposit" || key === "estimated_assets" || key === "evaluation_amount") {
+      // Only P&L carries a sign worth colouring. A price or a buy amount is
+      // always positive, and painting it green read as a gain in the trade list.
+      if (key.includes("profit")) {
         return `<span class="${toneForValue(value)}">${escapeHtml(formatMetric(value, "currency"))}</span>`;
+      }
+
+      if (key.includes("amount") || key.includes("price") || key.includes("fee") || key === "deposit" || key === "estimated_assets") {
+        return escapeHtml(formatMetric(value, "currency"));
       }
 
       if (key.endsWith("_no")) {
@@ -1522,49 +1574,225 @@ DASHBOARD_HTML = r"""<!doctype html>
       }).join("");
     }
 
+    // Total assets per trading session, with each session's change drawn
+    // underneath. The bare line showed the trend but not which days moved or
+    // by how much (2026-10-14).
+    let assetSeries = null;
+    let assetChartWidth = 0;
+
+    function signedWon(value) {
+      return `${value > 0 ? "+" : ""}${Math.round(value).toLocaleString("ko-KR")}원`;
+    }
+
+    function manWon(value) {
+      return `${(value / 10000).toLocaleString("ko-KR", { maximumFractionDigits: 1 })}만`;
+    }
+
+    function monthDay(date) {
+      return date.slice(5).replace("-", "/");
+    }
+
+    function niceStep(span, count) {
+      const raw = span / count;
+      const mag = 10 ** Math.floor(Math.log10(raw));
+      const n = raw / mag;
+      return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 2.5 ? 2.5 : n <= 5 ? 5 : 10) * mag;
+    }
+
+    function renderAssetStats(pts) {
+      const root = document.getElementById("asset-stats");
+      if (!root) return;
+      if (pts.length < 2) {
+        root.innerHTML = "";
+        return;
+      }
+      const first = pts[0];
+      const last = pts[pts.length - 1];
+      const peak = pts.reduce((a, p) => (p.value > a.value ? p : a), first);
+      // Flow days are deposits or withdrawals, not trading -- leave them out
+      // of the best/worst day and the up/down count.
+      const moves = pts.filter((p) => p.day_change != null && !p.flow_suspect);
+      const best = moves.reduce((a, p) => (p.day_change > 0 && (!a || p.day_change > a.day_change) ? p : a), null);
+      const worst = moves.reduce((a, p) => (p.day_change < 0 && (!a || p.day_change < a.day_change) ? p : a), null);
+      const ups = moves.filter((p) => p.day_change > 0).length;
+      const downs = moves.filter((p) => p.day_change < 0).length;
+      const total = last.value - first.value;
+      const fromPeak = last.value - peak.value;
+      const flows = pts.filter((p) => p.flow_suspect).length;
+      const flowSub = flows ? ` · 입출금 추정 ${flows}일 포함` : "";
+      const tone = (v) => (v > 0 ? "tone-positive" : v < 0 ? "tone-negative" : "");
+      const stat = (label, value, sub, cls = "") => `
+        <div class="ag-stat">
+          <div class="k">${escapeHtml(label)}</div>
+          <div class="v ${cls}">${escapeHtml(value)}</div>
+          <div class="s">${escapeHtml(sub)}</div>
+        </div>`;
+      root.innerHTML = [
+        stat("현재", wonText(last.value), `${monthDay(last.date)} 기준`),
+        stat("기간 변동", signedWon(total),
+          `${signedPct(total / first.value * 100)} · 상승 ${ups}일 · 하락 ${downs}일${flowSub}`, tone(total)),
+        stat("고점 대비", fromPeak === 0 ? "고점" : signedWon(fromPeak),
+          `고점 ${wonText(peak.value)} (${monthDay(peak.date)})`, tone(fromPeak)),
+        best
+          ? stat("최대 일간 상승", signedWon(best.day_change), `${monthDay(best.date)} · ${signedPct(best.day_change_pct)}`, "tone-positive")
+          : stat("최대 일간 상승", "-", "상승한 날 없음"),
+        worst
+          ? stat("최대 일간 하락", signedWon(worst.day_change), `${monthDay(worst.date)} · ${signedPct(worst.day_change_pct)}`, "tone-negative")
+          : stat("최대 일간 하락", "-", "하락한 날 없음"),
+      ].join("");
+    }
+
     function renderAssetChart(series) {
+      assetSeries = series;
       const root = document.getElementById("asset-chart");
       const note = document.getElementById("asset-chart-note");
       if (!root) return;
-      const pts = (series && Array.isArray(series.points)) ? series.points : [];
+      // Weekends and holidays repeat the previous close; the backend marks
+      // them from the index bars so only sessions are drawn.
+      const pts = ((series && Array.isArray(series.points)) ? series.points : [])
+        .filter((p) => p.trading_day !== false);
+      renderAssetStats(pts);
       if (pts.length < 2) {
         root.innerHTML = '<div class="empty-state">자산 추이 데이터가 부족합니다.</div>';
         if (note) note.textContent = (series && series.note) || "-";
         return;
       }
-      const W = 720, H = 220, padL = 64, padR = 16, padT = 16, padB = 28;
+
+      // Drawn at the container's own width so labels keep their size on a
+      // phone instead of shrinking with a scaled 720px canvas.
+      const W = Math.max(320, Math.round(root.clientWidth || 720));
+      assetChartWidth = W;
+      const narrow = W < 560;
+      const padL = narrow ? 50 : 72;
+      const padR = 10;
+      const lineTop = 10;
+      const lineH = narrow ? 160 : 200;
+      const barTop = lineTop + lineH + 34;
+      const barH = narrow ? 64 : 84;
+      const H = barTop + barH + 26;
+      const plotW = W - padL - padR;
+      const slot = plotW / pts.length;
+      const last = pts.length - 1;
+      const x = (i) => padL + slot * (i + 0.5);
+      const fmtAxis = narrow ? manWon : (v) => Math.round(v).toLocaleString("ko-KR");
+
+      // Line panel, on rounded ticks around the range.
       const vals = pts.map((p) => p.value);
-      let lo = Math.min(...vals), hi = Math.max(...vals);
-      if (lo === hi) { lo -= 1; hi += 1; }
-      const span = hi - lo;
-      const x = (i) => padL + (i / (pts.length - 1)) * (W - padL - padR);
-      const y = (v) => padT + (1 - (v - lo) / span) * (H - padT - padB);
+      let lo = Math.min(...vals);
+      let hi = Math.max(...vals);
+      const pad = Math.max((hi - lo) * 0.08, hi * 0.002, 1);
+      lo -= pad;
+      hi += pad;
+      const step = niceStep(hi - lo, narrow ? 4 : 5);
+      const y = (v) => lineTop + (1 - (v - lo) / (hi - lo)) * lineH;
+      let svg = "";
+      for (let k = Math.ceil(lo / step); k * step <= hi; k += 1) {
+        const t = k * step;
+        svg += `<line class="ac-grid" x1="${padL}" y1="${y(t).toFixed(1)}" x2="${W - padR}" y2="${y(t).toFixed(1)}"/>`
+          + `<text class="ac-tick" x="${padL - 8}" y="${(y(t) + 4).toFixed(1)}" text-anchor="end">${fmtAxis(t)}</text>`;
+      }
       const line = pts.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p.value).toFixed(1)}`).join(" ");
-      const area = `${line} L${x(pts.length - 1).toFixed(1)},${(H - padB).toFixed(1)} L${x(0).toFixed(1)},${(H - padB).toFixed(1)} Z`;
-      // y gridlines (lo / mid / hi)
-      const ticks = [lo, lo + span / 2, hi];
-      const grid = ticks.map((v) => {
-        const yy = y(v).toFixed(1);
-        return `<line x1="${padL}" y1="${yy}" x2="${W - padR}" y2="${yy}" stroke="#2a2e3a" stroke-width="1"/>`
-          + `<text x="${padL - 8}" y="${(y(v) + 4).toFixed(1)}" text-anchor="end" font-size="11" fill="#8a90a0">${Math.round(v).toLocaleString()}</text>`;
+      const base = (lineTop + lineH).toFixed(1);
+      svg += `<path class="ac-area" d="${line} L${x(last).toFixed(1)},${base} L${x(0).toFixed(1)},${base} Z"/>`
+        + `<path class="ac-line" d="${line}"/>`;
+      if (slot >= 6) {
+        svg += pts.map((p, i) => `<circle class="ac-dot" cx="${x(i).toFixed(1)}" cy="${y(p.value).toFixed(1)}" r="2"/>`).join("");
+      }
+      svg += `<circle class="ac-dot ac-dot--last" cx="${x(last).toFixed(1)}" cy="${y(pts[last].value).toFixed(1)}" r="4.5"/>`;
+
+      // Change panel: one bar per session against the previous session.
+      // Flow days are left out of the scale -- one deposit would flatten
+      // every real bar -- and drawn grey at full height instead.
+      const moves = pts.filter((p) => p.day_change != null && !p.flow_suspect).map((p) => Math.abs(p.day_change));
+      const maxAbs = Math.max(1, ...moves);
+      const mid = barTop + barH / 2;
+      const bw = Math.max(2, Math.min(18, slot * 0.64));
+      svg += `<text class="ac-caption" x="${padL}" y="${barTop - 12}">전일 대비 증감</text>`
+        + `<text class="ac-tick" x="${padL - 8}" y="${barTop + 4}" text-anchor="end">+${fmtAxis(maxAbs)}</text>`
+        + `<text class="ac-tick" x="${padL - 8}" y="${(mid + 4).toFixed(1)}" text-anchor="end">0</text>`
+        + `<text class="ac-tick" x="${padL - 8}" y="${barTop + barH + 4}" text-anchor="end">-${fmtAxis(maxAbs)}</text>`
+        + `<line class="ac-zero" x1="${padL}" y1="${mid}" x2="${W - padR}" y2="${mid}"/>`;
+      svg += pts.map((p, i) => {
+        if (p.day_change == null || p.day_change === 0) return "";
+        const up = p.day_change > 0;
+        const h = p.flow_suspect ? barH / 2 : Math.max(1, (Math.abs(p.day_change) / maxAbs) * (barH / 2));
+        const cls = p.flow_suspect ? "ac-bar--flow" : (up ? "ac-bar--up" : "ac-bar--down");
+        return `<rect class="${cls}" x="${(x(i) - bw / 2).toFixed(1)}" y="${(up ? mid - h : mid).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="1"/>`;
       }).join("");
-      const first = pts[0], last = pts[pts.length - 1];
-      const xlabels = `<text x="${x(0)}" y="${H - 8}" font-size="11" fill="#8a90a0">${first.date}</text>`
-        + `<text x="${W - padR}" y="${H - 8}" text-anchor="end" font-size="11" fill="#8a90a0">${last.date}</text>`;
-      const up = (series.change || 0) >= 0;
-      const stroke = up ? "#3fb950" : "#f85149";
-      const fill = up ? "rgba(63,185,80,0.12)" : "rgba(248,81,73,0.12)";
-      root.innerHTML =
-        `<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="총자산 추이">`
-        + grid
-        + `<path d="${area}" fill="${fill}" stroke="none"/>`
-        + `<path d="${line}" fill="none" stroke="${stroke}" stroke-width="2"/>`
-        + xlabels + `</svg>`;
+
+      // Dates under both panels; the last one always shows.
+      const every = Math.max(1, Math.ceil(pts.length / (narrow ? 4 : 7)));
+      svg += pts.map((p, i) => {
+        const keep = i === last || (i % every === 0 && last - i >= every * 0.6);
+        if (!keep) return "";
+        const anchor = i === 0 ? "start" : i === last ? "end" : "middle";
+        const xx = i === 0 ? padL : i === last ? W - padR : x(i);
+        return `<text class="ac-tick" x="${xx.toFixed(1)}" y="${H - 6}" text-anchor="${anchor}">${monthDay(p.date)}</text>`;
+      }).join("");
+
+      svg += `<line class="ac-guide" x1="0" y1="${lineTop}" x2="0" y2="${barTop + barH}" visibility="hidden"/>`
+        + `<circle class="ac-focus" r="4.5" cx="0" cy="0" visibility="hidden"/>`
+        + `<rect x="${padL}" y="0" width="${plotW}" height="${H}" fill="transparent"/>`;
+      root.innerHTML = `<svg viewBox="0 0 ${W} ${H}" width="100%" role="img" aria-label="거래일별 총자산과 전일 대비 증감">${svg}</svg>`
+        + `<div class="ac-tip" hidden></div>`;
+
+      const svgEl = root.querySelector("svg");
+      const guide = root.querySelector(".ac-guide");
+      const focus = root.querySelector(".ac-focus");
+      const tip = root.querySelector(".ac-tip");
+      const weekdays = "일월화수목금토";
+      const show = (event) => {
+        const box = svgEl.getBoundingClientRect();
+        if (!box.width) return;
+        const px = (event.clientX - box.left) * (W / box.width);
+        const i = Math.max(0, Math.min(last, Math.floor((px - padL) / slot)));
+        const p = pts[i];
+        const xx = x(i).toFixed(1);
+        guide.setAttribute("x1", xx);
+        guide.setAttribute("x2", xx);
+        guide.setAttribute("visibility", "visible");
+        focus.setAttribute("cx", xx);
+        focus.setAttribute("cy", y(p.value).toFixed(1));
+        focus.setAttribute("visibility", "visible");
+        const day = weekdays[new Date(`${p.date}T00:00:00Z`).getUTCDay()];
+        const change = p.day_change == null
+          ? "기간 첫 거래일"
+          : `전일 대비 ${signedWon(p.day_change)} (${signedPct(p.day_change_pct)})`;
+        const cls = p.day_change > 0 ? "tone-positive" : p.day_change < 0 ? "tone-negative" : "";
+        tip.innerHTML = `<div class="d">${escapeHtml(p.date)} (${day})</div>`
+          + `<div class="v">${escapeHtml(wonText(p.value))}</div>`
+          + `<div class="${cls}">${escapeHtml(change)}</div>`
+          + (p.flow_suspect ? `<div class="flow">입출금 추정 — 매매손익 아님</div>` : "");
+        tip.hidden = false;
+        const left = x(i) * (box.width / W);
+        const tw = tip.offsetWidth;
+        const placed = left > box.width / 2 ? left - tw - 12 : left + 12;
+        tip.style.left = `${Math.max(0, Math.min(box.width - tw, placed))}px`;
+      };
+      svgEl.addEventListener("pointermove", show);
+      svgEl.addEventListener("pointerdown", show);
+      svgEl.addEventListener("pointerleave", () => {
+        tip.hidden = true;
+        guide.setAttribute("visibility", "hidden");
+        focus.setAttribute("visibility", "hidden");
+      });
+
       if (note) {
-        const chg = series.change;
-        const chgTxt = (chg == null) ? "" :
-          ` · 기간 변동 ${chg >= 0 ? "+" : ""}${Math.round(chg).toLocaleString()}원`;
-        note.textContent = (series.note || "") + chgTxt;
+        const flows = pts.filter((p) => p.flow_suspect).length;
+        note.textContent = `${monthDay(pts[0].date)}~${monthDay(pts[last].date)} · 거래일 ${pts.length}일 · 입출금 포함, 매매손익 아님`
+          + (flows ? ` · 회색 막대 = 입출금 추정 ${flows}일` : "");
+      }
+    }
+
+    // Redraw at the new width; also catches the first time the chart becomes
+    // visible after rendering inside a hidden tab.
+    if (window.ResizeObserver) {
+      const assetChartRoot = document.getElementById("asset-chart");
+      if (assetChartRoot) {
+        new ResizeObserver(() => {
+          const w = Math.round(assetChartRoot.clientWidth);
+          if (assetSeries && w > 0 && Math.abs(w - assetChartWidth) > 4) renderAssetChart(assetSeries);
+        }).observe(assetChartRoot);
       }
     }
 
@@ -1573,7 +1801,7 @@ DASHBOARD_HTML = r"""<!doctype html>
       const items = [
         ["보유 종목 수", overview.holdings_count || 0],
         ["활성 주문 수", overview.active_orders_count || 0],
-        ["최근 체결 건수", overview.executions_count || 0],
+        ["기간 매매 건수", overview.trade_history_count || 0],
         ["숨은 진단 수", (overview.issues_count || 0) + (overview.empty_sources_count || 0)],
       ];
 
@@ -1678,39 +1906,51 @@ DASHBOARD_HTML = r"""<!doctype html>
 
     function renderActivity(payload, showEmpty) {
       const blocks = [];
+      const trades = payload.tables.trade_history;
       const executions = payload.tables.executions;
       const realized = payload.tables.realized_profit;
       const tradingJournal = payload.tables.trading_journal;
 
-      if ((executions.row_count || 0) > 0 || showEmpty) {
-        blocks.push(buildPaginatedPanel("executions", "체결 이력", "최근 체결 — 검색 / 페이징 가능", executions, {
+      if ((trades.row_count || 0) > 0 || showEmpty) {
+        blocks.push(buildPaginatedPanel("trade_history", "매매 이력", "기간 매수·매도", trades, {
           searchKeys: ["stock_name", "stock_code"],
           pageSize: 10,
-        }));
-      }
-
-      if ((tradingJournal.row_count || 0) > 0 || showEmpty) {
-        blocks.push(buildPaginatedPanel("trading_journal", "당일매매일지", "거래별 손익", tradingJournal, {
-          searchKeys: ["stock_name", "stock_code"],
-          pageSize: 10,
+          wide: true,
         }));
       }
 
       if ((realized.row_count || 0) > 0 || showEmpty) {
-        blocks.push(buildPaginatedPanel("realized", "실현손익", "기간 기준", realized, {
+        blocks.push(buildPaginatedPanel("realized", "실현손익", "기간 매도", realized, {
+          searchKeys: ["stock_name", "stock_code"],
+          pageSize: 10,
+          wide: true,
+        }));
+      }
+
+      if ((tradingJournal.row_count || 0) > 0 || showEmpty) {
+        blocks.push(buildPaginatedPanel("trading_journal", "당일매매일지", "오늘 종목별 손익", tradingJournal, {
+          searchKeys: ["stock_name", "stock_code"],
+          pageSize: 10,
+        }));
+      }
+
+      // ka10076 knows today's fills only, with their time and order number.
+      if ((executions.row_count || 0) > 0 || showEmpty) {
+        blocks.push(buildPaginatedPanel("executions", "오늘 체결", "시간·주문번호", executions, {
           searchKeys: ["stock_name", "stock_code"],
           pageSize: 10,
         }));
       }
 
       if (blocks.length === 0) {
-        activityRoot.innerHTML = buildEmpty("선택 기간에 표시할 체결 이력이나 실현손익이 없습니다.");
+        activityRoot.innerHTML = buildEmpty("선택 기간에 표시할 매매 이력이나 실현손익이 없습니다.");
         return;
       }
 
       activityRoot.innerHTML = `<div class="activity-grid">${blocks.join("")}</div>`;
 
       // Wire up search + pagination event handlers AFTER innerHTML write.
+      attachPanelHandlers("trade_history", trades, { pageSize: 10, searchKeys: ["stock_name", "stock_code"] });
       attachPanelHandlers("executions", executions, { pageSize: 10, searchKeys: ["stock_name", "stock_code"] });
       attachPanelHandlers("trading_journal", tradingJournal, { pageSize: 10, searchKeys: ["stock_name", "stock_code"] });
       attachPanelHandlers("realized", realized, { pageSize: 10, searchKeys: ["stock_name", "stock_code"] });
@@ -1719,11 +1959,12 @@ DASHBOARD_HTML = r"""<!doctype html>
     function buildPaginatedPanel(panelKey, title, subtitle, table, options) {
       const state = paginationState[panelKey] || (paginationState[panelKey] = { page: 0, search: "" });
       const totalRows = (table.rows || []).length;
+      const note = table.note ? ` · ${table.note}` : "";
       return `
-        <section class="subpanel" data-panel="${escapeHtml(panelKey)}">
+        <section class="subpanel${options.wide ? " wide" : ""}" data-panel="${escapeHtml(panelKey)}">
           <div class="subpanel-header">
             <h4>${escapeHtml(title)}</h4>
-            <span class="section-subtitle">${escapeHtml(subtitle)} · 총 ${totalRows}건</span>
+            <span class="section-subtitle">${escapeHtml(subtitle)} · 총 ${totalRows}건${escapeHtml(note)}</span>
           </div>
           <div class="panel-toolbar">
             <input

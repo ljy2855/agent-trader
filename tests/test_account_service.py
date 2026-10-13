@@ -267,3 +267,73 @@ def test_order_execution_status_uses_kt00009_contract() -> None:
         "qry_tp": "0",
         "dmst_stex_tp": "KRX",
     }
+
+
+def test_period_realized_profit_reads_ka10073_over_the_range() -> None:
+    """ka10073 takes both dates; ka10072 answered for the start day only."""
+
+    client = DummyClient(
+        {
+            "return_code": 0,
+            "return_msg": "조회가 완료되었습니다.",
+            "dt_stk_rlzt_pl": [
+                {"dt": "20260306", "stk_nm": "삼성전자", "stk_cd": "005930", "cntr_qty": "1",
+                 "buy_uv": "70000", "cntr_pric": "68000", "tdy_sel_pl": "-2196", "pl_rt": "-2.86",
+                 "tdy_trde_cmsn": "60", "tdy_trde_tax": "136"},
+            ],
+        }
+    )
+
+    result = asyncio.run(account_module.get_period_realized_profit(client, "20260301", "20260331"))
+
+    assert client.calls[0]["headers"]["api-id"] == "ka10073"
+    # The body the live endpoint answered on 2026-10-14.
+    assert client.calls[0]["json"] == {"strt_dt": "20260301", "end_dt": "20260331"}
+    assert result["success"] is True
+    assert result["realized_profit_data"][0]["tdy_sel_pl"] == "-2196"
+
+
+def test_trade_history_reads_kt00015_trades() -> None:
+    client = DummyClient(
+        {
+            "acnt_no": "",
+            "return_code": 0,
+            "return_msg": "조회가 완료되었습니다",
+            "trst_ovrl_trde_prps_array": [
+                {"trde_dt": "20260310", "cntr_dt": "20260306", "io_tp_nm": "매도", "trde_kind_nm": "매매",
+                 "stk_cd": "A005930", "stk_nm": "삼성전자", "trde_qty_jwa_cnt": "1", "trde_unit": "68,000",
+                 "trde_amt": "000000000068000", "tax_sum_cmsn": "000000000000166"},
+            ],
+        }
+    )
+
+    result = asyncio.run(account_module.get_trade_history(client, "20260301", "20260331"))
+
+    assert client.calls[0]["headers"]["api-id"] == "kt00015"
+    # The body the live endpoint answered on 2026-10-14; the spec table in the
+    # repo lists `end_dt` but not `strt_dt`.
+    assert client.calls[0]["json"] == {
+        "strt_dt": "20260301",
+        "end_dt": "20260331",
+        "tp": "3",
+        "stk_cd": "",
+        "crnc_cd": "",
+        "gds_tp": "1",
+        "frgn_stex_code": "",
+        "dmst_stex_tp": "%",
+    }
+    assert result["trade_history_data"][0]["cntr_dt"] == "20260306"
+
+
+def test_trading_journal_sends_base_dt_only_when_given() -> None:
+    """Today's call keeps the body it always had; a past day adds `base_dt`."""
+
+    payload = {"return_code": 0, "return_msg": "조회가 완료되었습니다.", "tdy_trde_diary": []}
+    today = DummyClient(payload)
+    past = DummyClient(payload)
+
+    asyncio.run(account_module.get_daily_trading_journal(today))
+    asyncio.run(account_module.get_daily_trading_journal(past, base_dt="20260306"))
+
+    assert today.calls[0]["json"] == {"ottks_tp": "2", "ch_crd_tp": "0"}
+    assert past.calls[0]["json"] == {"ottks_tp": "2", "ch_crd_tp": "0", "base_dt": "20260306"}
