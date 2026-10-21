@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 os.environ.setdefault("KIWOOM_APPKEY", "dummy-appkey")
 os.environ.setdefault("KIWOOM_SECRETKEY", "dummy-secretkey")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -232,3 +234,36 @@ def test_stock_detail_bundle_can_reuse_ttl_cache() -> None:
         "ka10004",
         "ka10005",
     ]
+
+
+class RaisingClient:
+    """Client stub whose POST always raises the supplied exception."""
+
+    def __init__(self, error: BaseException):
+        self._error = error
+
+    async def post(self, path: str, **kwargs: Any) -> DummyResponse:
+        raise self._error
+
+
+def test_transport_error_keeps_a_cause_when_its_message_is_empty() -> None:
+    """httpx timeouts stringify to "", and an empty `error` drops the cause.
+
+    From 2026-10-19 to 10-21 every read timed out resolving the host, and the
+    cycle's failure detail named the failing reads with no cause at all.
+    """
+
+    timed_out = asyncio.run(
+        market_module.get_top_gainers(RaisingClient(httpx.ConnectTimeout("")), mrkt_tp="000")
+    )
+    refused = asyncio.run(
+        market_module.get_top_gainers(
+            RaisingClient(httpx.ConnectError("[Errno -3] Temporary failure in name resolution")),
+            mrkt_tp="000",
+        )
+    )
+
+    assert timed_out["success"] is False
+    assert timed_out["error"] == "ConnectTimeout"
+    # A message that says something is kept as it was.
+    assert refused["error"] == "[Errno -3] Temporary failure in name resolution"

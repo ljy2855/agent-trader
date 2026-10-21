@@ -137,7 +137,8 @@ def _build_exception_result(
         "total_requests": 0,
         "total_records": 0,
         result_key: [],
-        "error": str(error),
+        # httpx timeouts stringify to "" — see market._build_exception_result.
+        "error": str(error) or type(error).__name__,
         "message": message,
         "note": "This requires proper Kiwoom API endpoint configuration",
     }

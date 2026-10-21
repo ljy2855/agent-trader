@@ -605,6 +605,35 @@ def test_degraded_sources_includes_a_failed_account_read() -> None:
     assert degraded[0]["error"] == "read timeout"
 
 
+def test_degraded_sources_keeps_the_cause_of_a_timed_out_read() -> None:
+    """A real wrapper result for an httpx timeout must reach the detail with a cause.
+
+    httpx timeouts stringify to "", and `_degraded_sources` skips empty values,
+    so from 2026-10-19 to 10-21 the detail read "account_evaluation; gainers;
+    kosdaq; kospi" — every read named, none explained.
+    """
+
+    import httpx
+
+    class TimingOutClient:
+        async def post(self, path, **kwargs):
+            raise httpx.ConnectTimeout("")
+
+    market_module = importlib.import_module("src.services.market")
+    account_module = importlib.import_module("src.services.account")
+    gainers = asyncio.run(market_module.get_top_gainers(TimingOutClient(), mrkt_tp="001"))
+    evaluation = asyncio.run(account_module.get_account_evaluation(TimingOutClient()))
+
+    degraded = strategy_module._degraded_sources(
+        evaluation, {"success": False, "sources": {"gainers": gainers}}
+    )
+
+    assert [(e["source"], e["error"]) for e in degraded] == [
+        ("account_evaluation", "ConnectTimeout"),
+        ("gainers", "ConnectTimeout"),
+    ]
+
+
 def test_degraded_sources_is_empty_on_a_clean_cycle() -> None:
     degraded = strategy_module._degraded_sources(
         {"success": True}, {"success": True, "sources": {"value": {"success": True}}}

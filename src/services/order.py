@@ -122,7 +122,8 @@ def _build_exception_result(
         "api_name": api_info.name,
         **context,
         result_key: None,
-        "error": str(error),
+        # httpx timeouts stringify to "" — see market._build_exception_result.
+        "error": str(error) or type(error).__name__,
         "message": message,
         "transport_state": transport_state or classify_transport_error(error),
         "note": "This requires proper Kiwoom API endpoint configuration",

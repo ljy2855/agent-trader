@@ -298,6 +298,21 @@ def test_connect_error_is_failed_not_unknown() -> None:
     assert applied.counts_as_exposure is False
 
 
+def test_timeout_without_a_message_still_names_its_cause() -> None:
+    """httpx timeouts stringify to "", which left the failure with no cause."""
+
+    client = RaisingClient(httpx.ConnectTimeout(""))
+
+    result = asyncio.run(
+        order_module.place_stock_buy_order(
+            client, stk_cd="005930", ord_qty="1", order_type_code="3"
+        )
+    )
+
+    assert result["error"] == "ConnectTimeout"
+    assert result["transport_state"] == "failed"
+
+
 def test_server_error_is_unknown() -> None:
     client = RaisingClient(_http_status_error(503))
 

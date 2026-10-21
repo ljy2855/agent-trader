@@ -9,6 +9,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 os.environ.setdefault("KIWOOM_APPKEY", "dummy-appkey")
 os.environ.setdefault("KIWOOM_SECRETKEY", "dummy-secretkey")
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -337,3 +339,24 @@ def test_trading_journal_sends_base_dt_only_when_given() -> None:
 
     assert today.calls[0]["json"] == {"ottks_tp": "2", "ch_crd_tp": "0"}
     assert past.calls[0]["json"] == {"ottks_tp": "2", "ch_crd_tp": "0", "base_dt": "20260306"}
+
+
+class RaisingClient:
+    """Client stub whose POST always raises the supplied exception."""
+
+    def __init__(self, error: BaseException):
+        self._error = error
+
+    async def post(self, path: str, **kwargs: Any) -> DummyResponse:
+        raise self._error
+
+
+def test_transport_error_keeps_a_cause_when_its_message_is_empty() -> None:
+    """httpx timeouts stringify to ""; the account read must still say why it failed."""
+
+    result = asyncio.run(
+        account_module.get_account_evaluation(RaisingClient(httpx.ReadTimeout("")))
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "ReadTimeout"

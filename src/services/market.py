@@ -104,7 +104,11 @@ def _build_exception_result(
         **context,
         payload_key: empty_payload,
         "total_records": 0,
-        "error": str(error),
+        # httpx timeouts stringify to "". Through 2026-10-19~21 every read
+        # timed out resolving the host, and an empty `error` dropped the cause
+        # from the cycle's failure detail: it named the failing reads and
+        # nothing else, so the outage read as a broker fault for three days.
+        "error": str(error) or type(error).__name__,
         "message": message,
         "note": "This requires proper Kiwoom API endpoint configuration",
     }
