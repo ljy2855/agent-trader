@@ -4556,6 +4556,66 @@ def test_degraded_tick_does_not_consume_a_pending_flip_announcement(monkeypatch)
     assert w._last_emitted_regime == "risk_off", "recovered tick must still fire"
 
 
+def _crash_regime(*, extreme, sticky):
+    return {
+        "regime": "risk_off",
+        "extreme_risk_off": extreme,
+        "extreme_risk_off_sticky": sticky,
+        "market_data_complete": True,
+    }
+
+
+def _crash_pages(monkeypatch, w, ticks) -> int:
+    """Run (now, regime) ticks and count the extreme_risk_off pages raised."""
+
+    raised: list[str] = []
+
+    async def record(event, *, planner_result):
+        raised.append(event.trigger_type)
+
+    monkeypatch.setattr(w, "_handle_trigger", record)
+    for now, regime in ticks:
+        monkeypatch.setattr(
+            watcher_module, "plan_intraday_momentum_strategy", _regime_plan(regime)
+        )
+        asyncio.run(w._tick(now=now))
+    return raised.count("extreme_risk_off")
+
+
+def test_a_market_sliding_into_a_crash_pages_the_squad(monkeypatch):
+    """2026-10-22: KOSPI breadth 0.34 → 0.16 over the afternoon, and no page.
+
+    The tick before the entry line is crossed sits inside the exit band, and
+    the detector took that tick as proof the crash was already known.
+    """
+
+    w = _build_watcher()
+    at = datetime(2026, 10, 22, 14, 15, tzinfo=KST)
+    ticks = [
+        (at, _crash_regime(extreme=False, sticky=False)),
+        (at + timedelta(seconds=30), _crash_regime(extreme=False, sticky=True)),
+        (at + timedelta(seconds=60), _crash_regime(extreme=True, sticky=True)),
+        (at + timedelta(seconds=90), _crash_regime(extreme=False, sticky=True)),
+        (at + timedelta(seconds=120), _crash_regime(extreme=True, sticky=True)),
+    ]
+
+    assert _crash_pages(monkeypatch, w, ticks) == 1
+
+
+def test_a_new_day_re_arms_the_crash_page(monkeypatch):
+    """A close inside the band must not silence the next morning's crash."""
+
+    w = _build_watcher()
+    close = datetime(2026, 10, 22, 15, 29, tzinfo=KST)
+    ticks = [
+        (close - timedelta(minutes=30), _crash_regime(extreme=True, sticky=True)),
+        (close, _crash_regime(extreme=False, sticky=True)),
+        (datetime(2026, 10, 23, 9, 1, tzinfo=KST), _crash_regime(extreme=True, sticky=True)),
+    ]
+
+    assert _crash_pages(monkeypatch, w, ticks) == 2
+
+
 def _candidate_row(code, *, score, eligible, name=None):
     return {
         "stock_code": code,

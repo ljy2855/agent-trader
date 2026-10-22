@@ -564,6 +564,11 @@ class IntradayWatcher:
         # name sold and bought back inherited the old position's peak.
         self._intraday_high_day: str | None = None
         self._prev_regime: dict[str, Any] | None = None
+        # KST date of the crash the market is still in — entered at the
+        # extreme_risk_off line and not cleared the exit band since — or None.
+        # A new day starts unlatched: the PM thread is per day, and a close
+        # inside the band must not silence the next morning's crash.
+        self._extreme_risk_off_day: str | None = None
         # Last regime label that we already announced as a flip — used as
         # the baseline for the next debounced flip detection.
         self._last_emitted_regime: str | None = None
@@ -1054,7 +1059,14 @@ class IntradayWatcher:
                     regime, regime_baseline
                 )
                 self._last_emitted_regime = cur_regime_label
-        events += triggers.detect_tier2_extreme_risk_off(regime, self._prev_regime)
+        day = self._last_tick_at.astimezone(KST).date().isoformat()
+        crash_latched = self._extreme_risk_off_day == day
+        events += triggers.detect_tier2_extreme_risk_off(
+            regime, self._prev_regime, latched=crash_latched
+        )
+        self._extreme_risk_off_day = (
+            day if triggers.extreme_risk_off_latched(regime, crash_latched) else None
+        )
         events += triggers.detect_tier2_global_health(
             api_failure_count=self._api_failure_count,
             open_order_count=open_order_count,

@@ -525,10 +525,31 @@ def _was_extreme(regime: dict[str, Any] | None) -> bool:
     return bool(regime.get("extreme_risk_off"))
 
 
+def extreme_risk_off_latched(regime: dict[str, Any] | None, latched: bool) -> bool:
+    """Whether the market is still in a crash after this tick.
+
+    The hysteresis state, which one tick's flags cannot carry. It is entered
+    at the entry line (``extreme_risk_off``) and left only once the market
+    clears the exit band. Inside the band it stays whatever it was: breadth
+    at 0.21 on the way down from 0.34 has not crashed yet, and at 0.21 on the
+    way up from 0.16 it has not recovered.
+
+    A degraded read clears it, so the next confident crash is paged rather
+    than swallowed — the rule the detector applies to an unconfident prior.
+    """
+
+    if not _regime_is_confident(regime):
+        return False
+    if (regime or {}).get("extreme_risk_off"):
+        return True
+    return latched and _was_extreme(regime)
+
+
 def detect_tier2_extreme_risk_off(
     regime: dict[str, Any],
     prev_regime: dict[str, Any] | None,
     *,
+    latched: bool | None = None,
     now: datetime | None = None,
 ) -> list[TriggerEvent]:
     """Fire on the rising edge of extreme_risk_off, with exit hysteresis.
@@ -547,24 +568,35 @@ def detect_tier2_extreme_risk_off(
     session, each one appending to a day-scoped issue that every later run
     re-read, which is what exhausted the codex quota. Sticky readings are
     still extreme for every other purpose — they just are not *new*.
+
+    ``latched`` says whether the market is already in a crash
+    (:func:`extreme_risk_off_latched`, tracked by the watcher). The prior tick
+    cannot say it: inside the band it may be a crash wobbling back or a slide
+    on its way into one. Reading every in-band prior as the first meant a
+    slide never paged, because 30-second ticks cross the band before they
+    cross the line. On 2026-10-22 KOSPI breadth went 0.34 at 13:00 to 0.16 at
+    15:01, the entry veto held from about 14:16 to 15:20, and the squad
+    heard nothing. Without ``latched`` the prior's flags still stand in.
     """
 
     ts = _now(now)
     if not _regime_is_confident(regime):
         return []
     cur_extreme = bool((regime or {}).get("extreme_risk_off"))
-    # Only a *confident* prior suppresses the edge. A degraded tick sets
-    # extreme_risk_off for the entry veto; letting it stand as the baseline
-    # would swallow the first real crash that follows an outage. Re-paging an
-    # ongoing crash is the safe direction, and the watcher's per-trigger
-    # cooldown drops the duplicate anyway.
-    #
-    # The prior counts as still-extreme when it was extreme by *either* band:
-    # the sticky flag is what holds the state through the hysteresis band, and
-    # falling back to the plain flag keeps older regimes (and hand-built test
-    # dicts) working exactly as before.
-    prev_extreme = _regime_is_confident(prev_regime) and _was_extreme(prev_regime)
-    if not (cur_extreme and not prev_extreme):
+    if latched is None:
+        # Only a *confident* prior suppresses the edge. A degraded tick sets
+        # extreme_risk_off for the entry veto; letting it stand as the
+        # baseline would swallow the first real crash that follows an outage.
+        # Re-paging an ongoing crash is the safe direction, and the watcher's
+        # per-trigger cooldown drops the duplicate anyway.
+        #
+        # The prior counts as still-extreme when it was extreme by *either*
+        # band. That is right for a crash wobbling back through the band and
+        # wrong for a slide into it, which is why the watcher passes
+        # ``latched``. Falling back to the plain flag keeps older regimes (and
+        # hand-built test dicts) working exactly as before.
+        latched = _regime_is_confident(prev_regime) and _was_extreme(prev_regime)
+    if not cur_extreme or latched:
         return []
     return [
         TriggerEvent(

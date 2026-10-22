@@ -31,6 +31,7 @@ from src.services.watcher_triggers import (  # noqa: E402
     detect_tier2_periodic_review,
     detect_tier2_regime_flip,
     detect_tier2_regime_label_flip,
+    extreme_risk_off_latched,
 )
 
 
@@ -540,6 +541,47 @@ def test_a_degraded_prior_still_does_not_suppress_a_real_crash():
     degraded = _regime(extreme=True, sticky=True, complete=False)
 
     assert len(detect_tier2_extreme_risk_off(CRASH, degraded)) == 1
+
+
+# 2026-10-22: the market slid into the crash instead of jumping into it. KOSPI
+# breadth was 0.34 at 13:00 and 0.16 at 15:01, and the entry veto held from
+# about 14:16 to 15:20 — with no page. A 30-second tick crosses the exit band
+# before it crosses the entry line, and an in-band prior read as "already
+# extreme", so the slide never made an edge. The state is now carried across
+# ticks, as the watcher does it here.
+
+
+def _pages(regimes) -> int:
+    latched, prev, pages = False, None, 0
+    for regime in regimes:
+        pages += len(detect_tier2_extreme_risk_off(regime, prev, latched=latched))
+        latched = extreme_risk_off_latched(regime, latched)
+        prev = regime
+    return pages
+
+
+def test_a_slide_through_the_band_pages_when_it_crosses_the_line():
+    assert _pages([RECOVERED, IN_BAND]) == 0
+    assert _pages([RECOVERED, IN_BAND, IN_BAND, CRASH]) == 1
+
+
+def test_a_crash_wobbling_through_the_band_still_pages_once():
+    """The 09-02 loop, held off by the carried state instead of the prior."""
+
+    assert _pages([RECOVERED, CRASH, IN_BAND, CRASH, IN_BAND, CRASH]) == 1
+
+
+def test_clearing_the_exit_band_re_arms_the_page():
+    assert _pages([CRASH, IN_BAND, RECOVERED, IN_BAND, CRASH]) == 2
+
+
+def test_a_degraded_read_does_not_hold_a_crash():
+    """Same rule as a degraded prior: an outage must not become the baseline."""
+
+    degraded = _regime(extreme=True, sticky=True, complete=False)
+
+    assert _pages([CRASH, degraded, CRASH]) == 2
+    assert extreme_risk_off_latched(degraded, True) is False
 
 
 # --- stale-order timestamps -------------------------------------------------
