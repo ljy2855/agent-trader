@@ -431,6 +431,25 @@ def _failure_rate_lines(
     return [(level, line) for _, level, line in graded]
 
 
+def restart_warning(started_at: str, today: str) -> str | None:
+    """A warning when the watcher restarted after today's open.
+
+    The watcher should run unbroken from the open, so a start from 09:00 KST
+    on means the day's session lost its in-memory state partway (13:53 on
+    2026-09-24). A start before the open is a deploy or restart the session
+    never saw. Warning about it only opened an issue to close (the 01:17
+    deploy on 2026-10-23).
+    """
+
+    try:
+        started = datetime.fromisoformat(started_at.replace("Z", "+00:00")).astimezone(KST)
+    except ValueError:
+        return None
+    if started.strftime("%Y-%m-%d") != today or started.time() < dtime(9, 0):
+        return None
+    return f"watcher가 오늘 개장 후 재시작됨 (started_at {started_at[:19]})"
+
+
 def main() -> int:
     today = _today_kst()
     state = _fetch_state()
@@ -486,16 +505,10 @@ def main() -> int:
         except ValueError:
             pass
 
-    # Unexpected restart: watcher should persist across the trading day, so
-    # a start timestamp dated today (KST) means it was restarted.
-    try:
-        sdate = datetime.fromisoformat(
-            started_at.replace("Z", "+00:00")
-        ).astimezone(KST).strftime("%Y-%m-%d")
-        if sdate == today:
-            warns.append(f"watcher가 오늘 재시작됨 (started_at {started_at[:19]})")
-    except ValueError:
-        pass
+    # Unexpected restart: watcher should persist across the trading day.
+    restart = restart_warning(started_at, today)
+    if restart:
+        warns.append(restart)
     if api_fail > API_FAILURE_WARN:
         warns.append(
             f"연속 실패 {api_fail}회 진행 중 (api_failure_count, 임계 {API_FAILURE_WARN} 초과)"

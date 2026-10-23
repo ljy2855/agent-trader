@@ -140,3 +140,23 @@ def test_repeated_transient_failures_escalate_to_red():
 
 def test_no_failed_runs_raise_nothing():
     assert digest.grade_failed_runs({}) == (None, None)
+
+
+def test_a_deploy_before_the_open_is_not_a_restart():
+    """2026-10-23: a 01:17 deploy opened a [점검 필요] issue for a clean session."""
+
+    assert digest.restart_warning("2026-10-23T01:17:51.040329+09:00", "2026-10-23") is None
+
+
+def test_a_restart_during_the_session_is_flagged():
+    """2026-09-24: the watcher restarted at 13:53, partway through the session."""
+
+    warn = digest.restart_warning("2026-09-24T13:53:02.512000+09:00", "2026-09-24")
+    assert warn is not None and "13:53:02" in warn
+    # A UTC stamp is read in KST: 04:53Z is 13:53 KST.
+    assert digest.restart_warning("2026-09-24T04:53:02Z", "2026-09-24") is not None
+
+
+def test_a_start_on_an_earlier_day_or_unreadable_is_quiet():
+    assert digest.restart_warning("2026-10-22T16:17:51+09:00", "2026-10-23") is None
+    assert digest.restart_warning("", "2026-10-23") is None
