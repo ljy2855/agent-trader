@@ -4616,6 +4616,57 @@ def test_a_new_day_re_arms_the_crash_page(monkeypatch):
     assert _crash_pages(monkeypatch, w, ticks) == 2
 
 
+class _BusyPmDispatcher(StubDispatcher):
+    """A PM that answers only when told to, so its dispatch stays in flight."""
+
+    def __init__(self):
+        super().__init__(action="ACKNOWLEDGE")
+        self.answer = asyncio.Event()
+
+    async def wait_for_new_action(self, issue_id, **kwargs):
+        await self.answer.wait()
+        return await super().wait_for_new_action(issue_id, **kwargs)
+
+
+def test_a_crash_at_the_open_waits_for_the_busy_pm(monkeypatch):
+    """2026-10-23: a crash from 09:00:41 to the close, and no page.
+
+    The 09:00 review goes out on the first tick, whose index read is not yet
+    complete, and holds the PM for about a minute. The crash showed on the
+    second tick, met the busy PM and was dropped — and latched, so it was
+    never raised again.
+    """
+
+    dispatcher = _BusyPmDispatcher()
+    w = _build_watcher(dispatcher=dispatcher)
+    opening = datetime(2026, 10, 23, 9, 0, tzinfo=KST)
+    degraded = {"regime": "risk_off", "extreme_risk_off": True, "market_data_complete": False}
+    crash = _crash_regime(extreme=True, sticky=True)
+
+    async def tick(now, regime):
+        monkeypatch.setattr(
+            watcher_module, "plan_intraday_momentum_strategy", _regime_plan(regime)
+        )
+        await w._tick(now=now)
+
+    def pages():
+        return [c for _, c in dispatcher.comments if "[트리거: extreme_risk_off]" in c]
+
+    async def driver():
+        await tick(opening, degraded)  # the 09:00 review goes out
+        await tick(opening + timedelta(seconds=41), crash)
+        assert pages() == [], "the PM is still on the review"
+        dispatcher.answer.set()
+        await w._in_flight["global:pm"].task
+        await tick(opening + timedelta(seconds=71), crash)
+        await tick(opening + timedelta(seconds=101), crash)
+        for slot in list(w._in_flight.values()):
+            await slot.task
+
+    asyncio.run(driver())
+    assert len(pages()) == 1
+
+
 def _candidate_row(code, *, score, eligible, name=None):
     return {
         "stock_code": code,

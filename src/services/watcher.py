@@ -567,7 +567,8 @@ class IntradayWatcher:
         # KST date of the crash the market is still in — entered at the
         # extreme_risk_off line and not cleared the exit band since — or None.
         # A new day starts unlatched: the PM thread is per day, and a close
-        # inside the band must not silence the next morning's crash.
+        # inside the band must not silence the next morning's crash. A page
+        # held back by a busy PM leaves it unset, so the next tick sends it.
         self._extreme_risk_off_day: str | None = None
         # Last regime label that we already announced as a flip — used as
         # the baseline for the next debounced flip detection.
@@ -1810,6 +1811,14 @@ class IntradayWatcher:
         if self._is_in_cooldown(event):
             return
         if event.tier != 1 and event.scope_key() in self._in_flight:
+            if event.trigger_type == "extreme_risk_off":
+                # Held back, not sent — so unlatch, and the next tick raises
+                # the page again. The crash edge fires once, often while the
+                # PM is still busy: the 09:00 review goes out on the first
+                # tick and takes about a minute, and the open's first complete
+                # index read is the second tick. On 2026-10-23 the market was
+                # in a crash from 09:00:41 to the close and nobody was paged.
+                self._extreme_risk_off_day = None
             return  # already processing this scope
         if self._should_skip_holding_swing(event):
             return  # repeat no-op on an idling holding — don't burn an agent call
