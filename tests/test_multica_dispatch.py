@@ -440,3 +440,187 @@ def test_comment_count_only_advances_on_a_successful_post():
 
     assert ok is False
     assert spy._comment_counts.get("id-0", 0) == 0
+
+
+# --- squad verdicts ---------------------------------------------------------
+#
+# On a squad issue the leader can pull a member into the thread by mention,
+# and both answer there. `wait_for_new_action` took the first valid tag from
+# anyone, so which verdict became an order was a race: on 2026-10-27 the
+# evaluator's REJECT on 한국전력 beat the screener's by 14 seconds, and on NAVER
+# the screener's provisional TIER2 — posted while the evaluator it had asked
+# was still working — was bought, and its REJECT two minutes later was never
+# read (SWO-1105). The fixtures below are shaped like those threads: the keys
+# are the ones `multica issue runs` / `issue comment list` actually return.
+
+from datetime import datetime, timezone  # noqa: E402
+
+SCREENER, EVALUATOR, MEMBER = "agent-screener", "agent-evaluator", "member-1"
+
+
+class _SquadStub(MulticaDispatcher):
+    """Scripted `list_runs` / `list_comments`, one entry per poll."""
+
+    def __init__(self, polls):
+        super().__init__(project="test-project", binary="/bin/false")
+        self._polls = list(polls)
+        self._current = ([], [])
+
+    async def list_runs(self, issue_id):  # type: ignore[override]
+        if self._polls:
+            self._current = self._polls.pop(0)
+        runs, _ = self._current
+        return None if runs is None else list(runs)
+
+    async def list_comments(self, issue_id):  # type: ignore[override]
+        return list(self._current[1])
+
+
+def _squad_run(run_id, agent, *, status="completed", completed_at=None, output="", leader=None):
+    run = {
+        "id": run_id,
+        "agent_id": agent,
+        "status": status,
+        "completed_at": completed_at,
+        "result": {"output": output} if status == "completed" else None,
+    }
+    # Multica sets the flag on the assignee's runs and leaves it out otherwise.
+    if leader if leader is not None else agent == SCREENER:
+        run["is_leader_task"] = True
+    return run
+
+
+def _squad_comment(author, created_at, content, source=None):
+    comment = {
+        "author_type": "agent" if author != MEMBER else "member",
+        "author_id": author,
+        "content": content,
+        "created_at": created_at,
+    }
+    if source:
+        comment["source_task_id"] = source
+    return comment
+
+
+# 2026-10-27 15:18:49 KST (06:18:49Z) NAVER new_candidate, less the slack.
+SINCE = datetime(2026, 10, 27, 6, 18, 19, tzinfo=timezone.utc)
+TRIGGER = _squad_comment(MEMBER, "2026-10-27T06:18:53Z", "트리거\n<!-- ACTION: XXX -->")
+MENTION = _squad_comment(SCREENER, "2026-10-27T06:19:32Z", "[@투자 평가사] 추세 검증", "A")
+PROVISIONAL = _squad_comment(SCREENER, "2026-10-27T06:19:59Z", "TIER2 판정\n<!-- ACTION: TIER2 -->", "B")
+ADVICE = _squad_comment(EVALUATOR, "2026-10-27T06:21:47Z", "REJECT\n<!-- ACTION: REJECT -->", "E")
+CORRECTION = _squad_comment(SCREENER, "2026-10-27T06:22:04Z", "REJECT로 정정\n<!-- ACTION: REJECT -->", "C")
+RUN_A = _squad_run("A", SCREENER, completed_at="2026-10-27T06:19:37Z", output="평가사에게 위임했습니다.")
+
+NAVER_POLLS = [
+    # 15:20:00 — the provisional TIER2 is up, B and the evaluator still running.
+    # The old wait returned here, and the watcher bought.
+    (
+        [RUN_A, _squad_run("B", SCREENER, status="running"), _squad_run("E", EVALUATOR, status="running")],
+        [TRIGGER, MENTION, PROVISIONAL],
+    ),
+    # 15:20:10 — B done; the evaluator is still checking the trend.
+    (
+        [
+            RUN_A,
+            _squad_run("B", SCREENER, completed_at="2026-10-27T06:20:06Z", output="TIER2로 판정했습니다."),
+            _squad_run("E", EVALUATOR, status="running"),
+        ],
+        [TRIGGER, MENTION, PROVISIONAL],
+    ),
+    # 15:22:10 — the evaluator rejected, the screener corrected, both done.
+    (
+        [
+            RUN_A,
+            _squad_run("B", SCREENER, completed_at="2026-10-27T06:20:06Z", output="TIER2로 판정했습니다."),
+            _squad_run("E", EVALUATOR, completed_at="2026-10-27T06:21:53Z", output="REJECT를 게시했습니다."),
+            _squad_run("C", SCREENER, completed_at="2026-10-27T06:22:09Z", output="REJECT로 정정했습니다."),
+        ],
+        [TRIGGER, MENTION, PROVISIONAL, ADVICE, CORRECTION],
+    ),
+]
+
+
+def _wait(stub, timeout=1.0, since=SINCE):
+    return asyncio.run(
+        stub.wait_for_squad_verdict(
+            "issue-1", since=since, timeout_seconds=timeout, poll_seconds=0.01
+        )
+    )
+
+
+def test_squad_verdict_waits_for_the_thread_to_settle():
+    """NAVER replayed: the screener's correction is the verdict, not its TIER2."""
+
+    resp = _wait(_SquadStub(NAVER_POLLS))
+
+    assert resp is not None
+    assert resp.action == "REJECT"
+    assert resp.run_id == "C"
+    assert resp.completed_at == datetime(2026, 10, 27, 6, 22, 4, tzinfo=timezone.utc)
+
+
+def test_a_members_tag_never_stands_in_for_the_leaders():
+    """한국전력 replayed, with the screener disagreeing for contrast."""
+
+    approval = _squad_comment(SCREENER, "2026-10-27T06:00:14Z", "<!-- ACTION: TIER1 -->", "C")
+    advice = _squad_comment(EVALUATOR, "2026-10-27T06:00:00Z", "<!-- ACTION: REJECT -->", "E")
+    evaluator_done = _squad_run("E", EVALUATOR, completed_at="2026-10-27T06:00:05Z")
+    polls = [
+        ([evaluator_done, _squad_run("C", SCREENER, status="running")], [advice]),
+        ([evaluator_done, _squad_run("C", SCREENER, completed_at="2026-10-27T06:00:20Z")], [advice, approval]),
+    ]
+
+    # 15:56:58 KST new_candidate, less the slack.
+    resp = _wait(_SquadStub(polls), since=datetime(2026, 10, 27, 5, 56, 28, tzinfo=timezone.utc))
+
+    assert resp is not None
+    assert (resp.action, resp.run_id) == ("TIER1", "C")
+
+
+def test_an_unsettled_thread_yields_the_leaders_newest_verdict_at_the_deadline():
+    polls = [([RUN_A, _squad_run("E", EVALUATOR, status="running")], [MENTION, PROVISIONAL])]
+
+    resp = _wait(_SquadStub(polls), timeout=0.05)
+
+    assert resp is not None
+    assert resp.action == "TIER2"
+
+
+def test_a_leader_run_without_a_tag_is_no_tag_even_if_a_member_answered():
+    polls = [
+        (
+            [RUN_A, _squad_run("E", EVALUATOR, completed_at="2026-10-27T06:21:53Z")],
+            [TRIGGER, MENTION, ADVICE],
+        )
+    ]
+
+    resp = _wait(_SquadStub(polls), timeout=0.05)
+
+    assert resp is not None
+    assert (resp.action, resp.run_id) == ("NO_TAG", "A")
+
+
+def test_no_leader_run_and_no_readable_runs_return_none():
+    assert _wait(_SquadStub([([_squad_run("A", SCREENER, status="running")], [])]), timeout=0.05) is None
+    assert _wait(_SquadStub([(None, [])]), timeout=0.05) is None
+
+
+def test_squad_thread_attributes_tags_and_skips_what_came_before():
+    stale = _squad_comment(SCREENER, "2026-10-27T06:10:00Z", "<!-- ACTION: TIER1 -->", "OLD")
+    # A leader comment without `source_task_id` is attributed by its author.
+    unsourced = _squad_comment(SCREENER, "2026-10-27T06:23:00Z", "<!-- ACTION: REJECT -->")
+    # A tag only in a run's output counts — once, even if a comment repeats it.
+    run_only = _squad_run("D", EVALUATOR, completed_at="2026-10-27T06:24:00Z", output="<!-- ACTION: HOLD -->")
+    both = _squad_run("C", SCREENER, completed_at="2026-10-27T06:22:09Z", output="<!-- ACTION: REJECT -->")
+    stub = _SquadStub([([RUN_A, both, run_only], [TRIGGER, stale, MENTION, CORRECTION, unsourced])])
+
+    thread = asyncio.run(stub.read_squad_thread("issue-1", since=SINCE))
+
+    assert thread is not None
+    assert [(v.action, v.leader, v.run_id) for v in thread.verdicts] == [
+        ("REJECT", True, "C"),
+        ("REJECT", True, None),
+        ("HOLD", False, "D"),
+    ]
+    assert thread.final_leader().action == "REJECT"
+    assert thread.active_runs == 0

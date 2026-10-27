@@ -38,7 +38,7 @@ import os
 import re
 from collections import deque
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from math import floor, isfinite
 from pathlib import Path
 from typing import Any, Callable
@@ -68,7 +68,13 @@ from .krx_calendar import (
     session_close_datetime,
 )
 from .krx_ticks import floor_to_stock_tick
-from .multica_dispatch import MulticaDispatcher, extract_action_tag
+from .multica_dispatch import (
+    ActionResponse,
+    MulticaDispatcher,
+    SquadThread,
+    Verdict,
+    extract_action_tag,
+)
 from . import order_ledger
 from .order_ledger import (
     STORAGE_NETWORK,
@@ -115,6 +121,12 @@ DEFAULT_STATE_PATH = (
 DEFAULT_CANDIDATE_JOURNAL_PATH = (
     Path(__file__).resolve().parents[2] / "output" / "candidate_scores.jsonl"
 )
+# One line per screened candidate: every verdict the screener gave, in order,
+# what other agents said on its thread, and what the watcher did. Written with
+# the score journal, under the same flag.
+DEFAULT_CANDIDATE_VERDICTS_PATH = (
+    Path(__file__).resolve().parents[2] / "output" / "candidate_verdicts.jsonl"
+)
 
 log = logging.getLogger("kiwoom.watcher")
 
@@ -155,6 +167,12 @@ AUCTION_PHASE_WAIT = "wait"      # before screening opens: no candidate dispatch
 AUCTION_PHASE_SCREEN = "screen"  # dispatch candidates, hold approvals
 AUCTION_PHASE_SUBMIT = "submit"  # the auction is running: submit held approvals
 AUCTION_PHASE_CLOSED = "closed"  # too late to submit, or no regular session
+
+# A screener verdict counts from the trigger's detection on. The slack covers
+# clock drift between this pod and the Multica server; an earlier verdict on
+# the same issue is at least a cooldown (300s) older.
+VERDICT_CLOCK_SLACK = timedelta(seconds=30)
+BUY_ACTIONS = frozenset({"TIER1", "TIER2"})
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +363,9 @@ class WatcherConfig:
     # minutes before the close until the auction starts.
     entry_execution: str = ENTRY_EXECUTION_IMMEDIATE
     close_auction_screen_minutes: int = 40
+    # With close_auction, the screener's thread is re-read this often until
+    # the close, so a retracted approval can be withdrawn before it fills.
+    verdict_follow_seconds: int = 30
     watchlist: list[str] = field(default_factory=list)
 
     # Daily new-entry circuit breaker. All three default to 0 = disabled so
@@ -484,6 +505,7 @@ class IntradayWatcher:
         ledger: OrderLedger | None = None,
         ledger_mountinfo_reader: Callable[[], str] | None = None,
         candidate_journal: CandidateJournal | None = None,
+        verdict_log_path: Path | None = None,
     ):
         self._settings = settings
         self._config = config
@@ -506,6 +528,9 @@ class IntradayWatcher:
             DEFAULT_CANDIDATE_JOURNAL_PATH
             if config.record_candidate_scores
             else None
+        )
+        self._verdict_log_path = verdict_log_path or (
+            DEFAULT_CANDIDATE_VERDICTS_PATH if config.record_candidate_scores else None
         )
         self._stop_event = asyncio.Event()
         self._buy_lock = asyncio.Lock()
@@ -605,6 +630,11 @@ class IntradayWatcher:
         # until the close, so the stale-order cancel must leave them alone.
         self._close_auction_entries: dict[str, CloseAuctionEntry] = {}
         self._close_auction_orders: set[tuple[str, str]] = set()
+        # code -> (trading_day, order_no, quantity) of the auction buy, so a
+        # retraction can cancel it; and the (trading_day, code) the screener
+        # has retracted, which no later submit may buy.
+        self._close_auction_buys: dict[str, tuple[str, str, int]] = {}
+        self._retracted_entries: set[tuple[str, str]] = set()
         self._last_known_run_id: dict[str, str] = {}  # issue_id -> run_id
         self._trigger_log: dict[str, TriggerLogEntry] = {}  # scope_key -> log entry
         self._cycle_count = 0
@@ -2627,12 +2657,20 @@ class IntradayWatcher:
         stage = FAILURE_MULTICA
         stage_label = "agent 응답 대기"
         try:
-            response = await self._dispatcher.wait_for_new_action(
-                issue_id,
-                prev_run_id=prev_run_id,
-                timeout_seconds=self._config.agent_timeout_seconds,
-                poll_seconds=self._config.agent_poll_seconds,
-            )
+            if self._issue_type_for_event(event) == "candidate":
+                response = await self._dispatcher.wait_for_squad_verdict(
+                    issue_id,
+                    since=self._verdict_since(event),
+                    timeout_seconds=self._config.agent_timeout_seconds,
+                    poll_seconds=self._config.agent_poll_seconds,
+                )
+            else:
+                response = await self._dispatcher.wait_for_new_action(
+                    issue_id,
+                    prev_run_id=prev_run_id,
+                    timeout_seconds=self._config.agent_timeout_seconds,
+                    poll_seconds=self._config.agent_poll_seconds,
+                )
             if response is None:
                 log.warning(
                     "tier2 timeout: %s (no agent response within %ss)",
@@ -2803,6 +2841,11 @@ class IntradayWatcher:
             await self._notify_tier2_outcome(
                 event, final_response.action, apply_result, peer_response
             )
+            if self._issue_type_for_event(event) == "candidate":
+                stage, stage_label = FAILURE_MULTICA, "스크리너 판정 추적"
+                await self._follow_screener_verdict(
+                    event, issue_id, accepted=final_response, applied=apply_result
+                )
         except asyncio.CancelledError:
             # Normal shutdown path (`_cancel_in_flight`) — or, rarely, someone
             # cancelling this one slot. Either way it is not a fault: record it
@@ -3228,6 +3271,11 @@ class IntradayWatcher:
             return OrderApplyResult.skipped(action, "신규 매수 중지 모드 — 보호매도/취소만 허용")
         if not self._is_market_open(self._market_session_status().observed_at):
             return OrderApplyResult.skipped(action, "정규장 종료/불확실 — 신규 매수 차단")
+        if (
+            self._market_session_status().observed_at.date().isoformat(),
+            order_ledger.normalize_stock_code(event.stock_code),
+        ) in self._retracted_entries:
+            return OrderApplyResult.skipped(action, "스크리너가 승인을 REJECT로 정정 — 매수 생략")
 
         # Daily circuit breaker — the first gate on the only path that opens
         # new exposure. Deliberately not reachable from `_apply_holding_action`
@@ -3483,11 +3531,10 @@ class IntradayWatcher:
             order_ledger.normalize_order_no(result.order_no) if close_auction else None
         )
         if auction_order_no:
-            self._close_auction_orders.add(
-                (
-                    self._market_session_status().observed_at.date().isoformat(),
-                    auction_order_no,
-                )
+            day = self._market_session_status().observed_at.date().isoformat()
+            self._close_auction_orders.add((day, auction_order_no))
+            self._close_auction_buys[order_ledger.normalize_stock_code(code)] = (
+                day, auction_order_no, quantity,
             )
         # `submitted` for sure, and `unknown` too — a lost response might still
         # have booked the order, and treating it as nothing is how the same
@@ -3764,9 +3811,15 @@ class IntradayWatcher:
         a warning rather than a silent miss.
         """
 
+        today = self._market_session_status().observed_at.date().isoformat()
+        self._close_auction_buys = {
+            code: buy for code, buy in self._close_auction_buys.items() if buy[0] == today
+        }
+        self._retracted_entries = {
+            key for key in self._retracted_entries if key[0] == today
+        }
         if not self._close_auction_entries and not self._close_auction_orders:
             return
-        today = self._market_session_status().observed_at.date().isoformat()
         self._close_auction_orders = {
             key for key in self._close_auction_orders if key[0] == today
         }
@@ -3804,6 +3857,202 @@ class IntradayWatcher:
         self._status.set_close_auction_entries(
             [entry.to_dict() for entry in self._close_auction_entries.values()]
         )
+
+    # -- the screener's verdict after it was applied -------------------------
+
+    def _verdict_since(self, event: TriggerEvent) -> datetime:
+        return event.detected_at.astimezone(timezone.utc) - VERDICT_CLOCK_SLACK
+
+    async def _follow_screener_verdict(
+        self,
+        event: TriggerEvent,
+        issue_id: str,
+        *,
+        accepted: ActionResponse,
+        applied: OrderApplyResult,
+    ) -> None:
+        """Keep reading the screener's thread until the closing auction runs.
+
+        The verdict the watcher acted on can still change: on 2026-10-27 the
+        screener corrected NAVER from TIER2 to REJECT at 15:22, eight minutes
+        before the auction filled the buy it no longer wanted (SWO-1105). A
+        REJECT after an approval withdraws it — a held entry is dropped, a
+        submitted order cancelled. Only that direction acts. A cancel reduces
+        exposure; a TIER after a REJECT would be a buy the entry gates never
+        saw, so it is recorded and nothing more.
+
+        Every verdict on the thread goes to the verdict log at the end, so the
+        screener's first and final calls can be compared on outcomes.
+        """
+
+        close = session_close_datetime(self._market_session_status())
+        since = self._verdict_since(event)
+        thread: SquadThread | None = None
+        withdrawal: str | None = None
+        if self._close_auction_phase() is not None and close is not None:
+            while True:
+                await asyncio.sleep(self._config.verdict_follow_seconds)
+                try:
+                    thread = (
+                        await self._dispatcher.read_squad_thread(issue_id, since=since)
+                        or thread
+                    )
+                except Exception as exc:  # noqa: BLE001 - one bad read must not end the follow
+                    detail = self._record_failure(FAILURE_MULTICA, exc)
+                    log.warning(
+                        "verdict follow read failed: %s — %s", event.cooldown_key(), detail
+                    )
+                # After the read: a retraction read past the close is history.
+                now = self._market_session_status().observed_at
+                final = thread.final_leader() if thread else None
+                if (
+                    withdrawal is None
+                    and now < close
+                    and accepted.action in BUY_ACTIONS
+                    and final is not None
+                    and final.action == "REJECT"
+                    and (accepted.completed_at is None or final.at > accepted.completed_at)
+                ):
+                    withdrawal = await self._withdraw_retracted_buy(event, final)
+                if now >= close:
+                    break
+        self._record_verdicts(event, issue_id, accepted, applied, thread, withdrawal)
+
+    async def _withdraw_retracted_buy(self, event: TriggerEvent, verdict: Verdict) -> str:
+        """Take back a buy the screener has since rejected. Returns what was done."""
+
+        code = order_ledger.normalize_stock_code(event.stock_code)
+        day = self._market_session_status().observed_at.date().isoformat()
+        target = f"{event.stock_name or code} ({code})"
+        when = verdict.at.astimezone(KST).strftime("%H:%M:%S")
+        log.warning("screener retracted its approval of %s at %s", code, when)
+        cancel: OrderApplyResult | None = None
+        order_no = None
+        # Under the buy lock: a submit that already took the entry off the
+        # held list finishes first, and its order is cancelled below; one that
+        # has not started finds the code retracted and buys nothing.
+        async with self._buy_lock:
+            self._retracted_entries.add((day, code))
+            if self._close_auction_entries.pop(code, None) is not None:
+                self._publish_close_auction_entries()
+                outcome = "dropped"
+            elif (order := self._close_auction_buys.get(code)) and order[0] == day:
+                _, order_no, quantity = order
+                cancel = await self._cancel_auction_buy(code, order_no, quantity)
+                outcome = f"cancel_{cancel.state}"
+            else:
+                return "nothing_live"
+
+        if cancel is None:
+            await self._notifier.warn(
+                "종가 동시호가 매수 철회",
+                f"{target} — 스크리너가 {when}에 REJECT로 정정해 예약을 버렸다",
+            )
+        elif cancel.state == ORDER_STATE_SUBMITTED:
+            await self._notifier.warn(
+                "종가 동시호가 매수 취소 접수",
+                f"{target} — 스크리너가 {when}에 REJECT로 정정해 주문 {order_no}을 "
+                "취소했다 (브로커 접수, 확인 아님)",
+            )
+        elif cancel.state == ORDER_STATE_UNKNOWN:
+            await self._notifier.error(
+                "종가 동시호가 매수 취소 접수 불명",
+                f"{target} 주문 {order_no} — {cancel.reason or '응답 유실'}\n"
+                "취소 여부 미확인 — 미체결/체결 조회로 확인 필요",
+            )
+        else:
+            await self._notifier.error(
+                "종가 동시호가 매수 취소 실패",
+                f"{target} 주문 {order_no} — {cancel.reason or cancel.state}\n"
+                "스크리너가 철회한 매수가 동시호가에서 체결될 수 있다",
+            )
+        return outcome
+
+    async def _cancel_auction_buy(
+        self, code: str, order_no: str, quantity: int
+    ) -> OrderApplyResult:
+        # Recorded for audit but never gated, like the stale-order cancel: a
+        # cancel reduces exposure, so a ledger fault must not stand in its way.
+        intent, duplicate = await self._record_protective_intent(
+            stock_code=code,
+            side=order_ledger.SIDE_CANCEL,
+            quantity=quantity,
+            price=None,
+            origin="screener_retraction",
+            decision_scope="screener_retraction",
+        )
+        if duplicate is not None:
+            return OrderApplyResult.skipped("CANCEL", duplicate)
+        # The number as the open-order view spells it, which is what the
+        # stale-order cancel sends; the buy response's number is normalized.
+        orig_ord_no = next(
+            (
+                str(row.get("ord_no")).strip()
+                for row in self._last_open_orders
+                if isinstance(row, dict)
+                and order_ledger.normalize_order_no(row.get("ord_no")) == order_no
+            ),
+            order_no,
+        )
+        order_result = await order_service.cancel_stock_order(
+            self._client,
+            orig_ord_no=orig_ord_no,
+            stk_cd=code,
+            cncl_qty=str(quantity),
+        )
+        result = OrderApplyResult.from_order_response("CANCEL", order_result)
+        self._settle_intent(intent, result)
+        return result
+
+    def _record_verdicts(
+        self,
+        event: TriggerEvent,
+        issue_id: str,
+        accepted: ActionResponse,
+        applied: OrderApplyResult,
+        thread: SquadThread | None,
+        withdrawal: str | None,
+    ) -> None:
+        """Append the candidate's verdict history. Best-effort, like the journal."""
+
+        if self._verdict_log_path is None:
+            return
+
+        def at(moment: datetime | None) -> str | None:
+            return moment.astimezone(KST).isoformat() if moment else None
+
+        verdicts = thread.verdicts if thread else []
+        now = self._market_session_status().observed_at
+        record = {
+            "ts": now.isoformat(),
+            "trading_day": now.date().isoformat(),
+            "code": event.stock_code,
+            "name": event.stock_name,
+            "issue_id": issue_id,
+            "detected_at": event.detected_at.isoformat(),
+            "score": event.snapshot.get("score"),
+            "reference_price": event.snapshot.get("current_price"),
+            "accepted": accepted.action,
+            "accepted_at": at(accepted.completed_at),
+            "applied": applied.state,
+            "applied_reason": applied.reason,
+            "order_no": applied.order_no,
+            "screener": [
+                {"action": v.action, "at": at(v.at)} for v in verdicts if v.leader
+            ],
+            "others": [
+                {"action": v.action, "at": at(v.at), "agent_id": v.agent_id}
+                for v in verdicts
+                if not v.leader
+            ],
+            "withdrawal": withdrawal,
+        }
+        try:
+            self._verdict_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._verdict_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            log.warning("verdict log write failed: %s", exc)
 
     async def _post_close_reconcile(self, session: KrxSessionStatus) -> bool:
         """Settle today's orders in the minutes after the close.

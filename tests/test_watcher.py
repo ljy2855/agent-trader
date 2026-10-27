@@ -143,6 +143,21 @@ class StubDispatcher:
             completed_at=None,
         )
 
+    # Candidate issues wait on the squad leader. Routed through
+    # `wait_for_new_action` so a subclass overriding that one answers both.
+    async def wait_for_squad_verdict(
+        self, issue_id, *, since, timeout_seconds, poll_seconds=10
+    ):
+        return await self.wait_for_new_action(
+            issue_id,
+            prev_run_id=None,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+        )
+
+    async def read_squad_thread(self, issue_id, *, since):
+        return None
+
 
 def _settings() -> Settings:
     return Settings(
@@ -6453,3 +6468,251 @@ def test_intraday_high_starts_over_each_trading_day():
         [later], {}, swing_pct=2.5, high_drop_pct=2.0
     )
     assert "고점 이탈" in event.reason
+
+
+# -- the screener's verdict after the watcher acted on it ---------------------
+#
+# 2026-10-27, NAVER (SWO-1105): the screener posted a provisional TIER2 at
+# 15:19:59 while the evaluator it had asked was still checking, the watcher
+# put it into the closing auction at 15:20:00, and the screener's REJECT at
+# 15:22:04 was never read — the auction filled the buy at 15:30.
+
+import json  # noqa: E402
+
+from src.services.multica_dispatch import SquadThread, Verdict  # noqa: E402
+
+
+def _verdict(action, at, *, leader=True):
+    return Verdict(
+        action=action,
+        at=at,
+        agent_id="agent-screener" if leader else "agent-evaluator",
+        leader=leader,
+        run_id=None,
+        text=f"<!-- ACTION: {action} -->",
+    )
+
+
+def _thread(*verdicts):
+    return SquadThread(verdicts=list(verdicts), active_runs=0)
+
+
+class _FollowDispatcher(StubDispatcher):
+    """Answers the wait with ``first`` at ``first_at``, then replays ``reads``.
+
+    Each read moves the watcher's clock to its time, the way a live session
+    moves on between polls. The last read repeats once the script runs out.
+    """
+
+    def __init__(self, first, first_at, reads):
+        super().__init__(action=first)
+        self.first_at = first_at
+        self.reads = list(reads)
+        self.watcher = None
+        self.since = None
+        self.read_count = 0
+
+    async def wait_for_squad_verdict(self, issue_id, *, since, timeout_seconds, poll_seconds=10):
+        self.since = since
+        return ActionResponse(
+            action=self._action,
+            output=f"<!-- ACTION: {self._action} -->",
+            run_id="B",
+            completed_at=self.first_at,
+        )
+
+    async def read_squad_thread(self, issue_id, *, since):
+        self.read_count += 1
+        assert self.read_count < 50, "follow never reached the close"
+        clock, thread = self.reads.pop(0) if len(self.reads) > 1 else self.reads[0]
+        _move_clock(self.watcher, clock)
+        return thread
+
+
+def _follow_watcher(at, dispatcher, tmp_path):
+    w = _auction_watcher(at, dispatcher=dispatcher, verdict_follow_seconds=0)
+    dispatcher.watcher = w
+    w._verdict_log_path = tmp_path / "candidate_verdicts.jsonl"
+    _stub_still_valid(w, _auction_detail(287_000))
+    return w
+
+
+def _record_cancels(monkeypatch, response=None):
+    cancels: list[dict] = []
+
+    async def fake_cancel(client, **kwargs):
+        cancels.append(kwargs)
+        return response or _ok_order(order_no="0001240")
+
+    monkeypatch.setattr(watcher_module.order_service, "cancel_stock_order", fake_cancel)
+    return cancels
+
+
+def _verdict_log(w):
+    return [json.loads(line) for line in w._verdict_log_path.read_text().splitlines()]
+
+
+def test_naver_replay_a_retracted_auction_buy_is_cancelled(monkeypatch, tmp_path):
+    buys = _record_buys(monkeypatch)
+    cancels = _record_cancels(monkeypatch)
+    provisional = _verdict("TIER2", _at(15, 19, 59))
+    corrected = _thread(
+        provisional,
+        _verdict("REJECT", _at(15, 21, 47), leader=False),
+        _verdict("REJECT", _at(15, 22, 4)),
+    )
+    d = _FollowDispatcher(
+        "TIER2",
+        _at(15, 19, 59),
+        [
+            (_at(15, 20, 30), _thread(provisional)),
+            (_at(15, 22, 10), corrected),
+            (_at(15, 30, 5), corrected),
+        ],
+    )
+    w = _follow_watcher(_at(15, 20), d, tmp_path)
+    event = _auction_candidate(detected_at=_at(15, 18, 49))
+    entry = _entry_for(event)
+
+    asyncio.run(w._await_and_apply(event, entry, "candidate-1", None, _AUCTION_PLANNER))
+
+    # The provisional TIER2 still went in — that is what the screener said
+    # when its thread went quiet — and was then taken back.
+    assert len(buys) == 1
+    assert cancels == [
+        {"orig_ord_no": "1234", "stk_cd": "005930", "cncl_qty": buys[0]["ord_qty"]}
+    ]
+    assert entry.outcome == "submitted"
+    assert any(
+        kind == "warn" and "취소 접수" in title for kind, title, _ in w._notifier.calls
+    )
+    assert d.since == _at(15, 18, 49) - timedelta(seconds=30)
+    [record] = _verdict_log(w)
+    assert record["screener"] == [
+        {"action": "TIER2", "at": _at(15, 19, 59).isoformat()},
+        {"action": "REJECT", "at": _at(15, 22, 4).isoformat()},
+    ]
+    assert [o["action"] for o in record["others"]] == ["REJECT"]
+    assert (record["accepted"], record["applied"], record["withdrawal"]) == (
+        "TIER2", "submitted", "cancel_submitted",
+    )
+    assert w._in_flight == {}
+
+
+def test_a_retraction_before_the_auction_drops_the_held_entry(monkeypatch, tmp_path):
+    buys = _record_buys(monkeypatch)
+    approval = _verdict("TIER1", _at(14, 55, 20))
+    retracted = _thread(approval, _verdict("REJECT", _at(15, 4, 50)))
+    d = _FollowDispatcher(
+        "TIER1", _at(14, 55, 20), [(_at(15, 5), retracted), (_at(15, 31), retracted)]
+    )
+    w = _follow_watcher(_at(14, 55, 30), d, tmp_path)
+    event = _auction_candidate(detected_at=_at(14, 54, 30))
+
+    asyncio.run(w._await_and_apply(event, _entry_for(event), "candidate-1", None, _AUCTION_PLANNER))
+
+    assert w._close_auction_entries == {}
+    assert w.status.snapshot()["close_auction_entries"] == []
+    assert any(kind == "warn" and "철회" in title for kind, title, _ in w._notifier.calls)
+    # Nothing left for the auction to send, and the code stays retracted.
+    _move_clock(w, _at(15, 21))
+    _held(w, action="TIER1")
+    asyncio.run(w._submit_close_auction_entries(_AUCTION_PLANNER))
+    assert buys == []
+    assert _verdict_log(w)[0]["withdrawal"] == "dropped"
+
+
+def test_a_retraction_racing_the_submit_stops_the_buy(monkeypatch):
+    """The submit has taken the entry and waits on the buy lock when it lands."""
+
+    buys = _record_buys(monkeypatch)
+    w = _auction_watcher(_at(15, 20, 5))
+    _stub_still_valid(w, _auction_detail(287_000))
+    _held(w, action="TIER1")
+
+    async def scenario():
+        await w._buy_lock.acquire()
+        withdraw = asyncio.create_task(
+            w._withdraw_retracted_buy(_auction_candidate(), _verdict("REJECT", _at(15, 20, 4)))
+        )
+        await asyncio.sleep(0)
+        submit = asyncio.create_task(w._submit_close_auction_entries(_AUCTION_PLANNER))
+        await asyncio.sleep(0)
+        assert w._close_auction_entries == {}  # the submit already took it
+        w._buy_lock.release()
+        return await withdraw, await submit
+
+    outcome, _ = asyncio.run(scenario())
+
+    assert outcome == "nothing_live"
+    assert buys == []
+    assert any(
+        "REJECT로 정정" in description for _, _, description in w._notifier.calls
+    )
+
+
+def test_a_late_approval_after_a_reject_buys_nothing(monkeypatch, tmp_path):
+    buys = _record_buys(monkeypatch)
+    cancels = _record_cancels(monkeypatch)
+    upgraded = _thread(_verdict("REJECT", _at(14, 55, 20)), _verdict("TIER1", _at(15, 0)))
+    d = _FollowDispatcher(
+        "REJECT", _at(14, 55, 20), [(_at(15, 1), upgraded), (_at(15, 31), upgraded)]
+    )
+    w = _follow_watcher(_at(14, 55, 30), d, tmp_path)
+    event = _auction_candidate(detected_at=_at(14, 54, 30))
+
+    asyncio.run(w._await_and_apply(event, _entry_for(event), "candidate-1", None, _AUCTION_PLANNER))
+    _move_clock(w, _at(15, 21))
+    asyncio.run(w._submit_close_auction_entries(_AUCTION_PLANNER))
+
+    assert buys == [] and cancels == []
+    [record] = _verdict_log(w)
+    assert [v["action"] for v in record["screener"]] == ["REJECT", "TIER1"]
+    assert record["withdrawal"] is None
+
+
+def test_a_retraction_read_after_the_close_cancels_nothing(monkeypatch, tmp_path):
+    buys = _record_buys(monkeypatch)
+    cancels = _record_cancels(monkeypatch)
+    late = _thread(_verdict("TIER2", _at(15, 22)), _verdict("REJECT", _at(15, 29, 58)))
+    d = _FollowDispatcher("TIER2", _at(15, 22), [(_at(15, 30, 5), late)])
+    w = _follow_watcher(_at(15, 22, 10), d, tmp_path)
+    event = _auction_candidate(detected_at=_at(15, 21))
+
+    asyncio.run(w._await_and_apply(event, _entry_for(event), "candidate-1", None, _AUCTION_PLANNER))
+
+    assert len(buys) == 1
+    assert cancels == []
+    assert _verdict_log(w)[0]["withdrawal"] is None
+
+
+def test_a_refused_cancel_pages_that_the_buy_may_still_fill(monkeypatch, tmp_path):
+    _record_buys(monkeypatch)
+    _record_cancels(monkeypatch, response=_rejected_order())
+    retracted = _thread(_verdict("TIER2", _at(15, 22)), _verdict("REJECT", _at(15, 25)))
+    d = _FollowDispatcher(
+        "TIER2", _at(15, 22), [(_at(15, 25, 10), retracted), (_at(15, 30, 5), retracted)]
+    )
+    w = _follow_watcher(_at(15, 22, 10), d, tmp_path)
+    event = _auction_candidate(detected_at=_at(15, 21))
+
+    asyncio.run(w._await_and_apply(event, _entry_for(event), "candidate-1", None, _AUCTION_PLANNER))
+
+    assert any(
+        kind == "error" and "취소 실패" in title for kind, title, _ in w._notifier.calls
+    )
+    assert _verdict_log(w)[0]["withdrawal"] == "cancel_failed"
+
+
+def test_the_retraction_cancel_spells_the_order_number_like_the_open_order_view(monkeypatch):
+    """The stale-order cancel sends ka10075's `ord_no` as is; so does this one."""
+
+    cancels = _record_cancels(monkeypatch)
+    w = _auction_watcher(_at(15, 22))
+    w._last_open_orders = [{"ord_no": "0001234", "stk_cd": "005930", "oso_qty": "3"}]
+
+    result = asyncio.run(w._cancel_auction_buy("005930", "1234", 3))
+
+    assert result.state == "submitted"
+    assert cancels == [{"orig_ord_no": "0001234", "stk_cd": "005930", "cncl_qty": "3"}]
+    assert [i.side for i in w._ledger.unresolved()] == ["cancel"]

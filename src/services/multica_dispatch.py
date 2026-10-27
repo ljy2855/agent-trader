@@ -13,7 +13,9 @@ Issue layout:
 
 The watcher posts trigger comments and waits asynchronously for the
 agent's next *new* completed run, parsing the ``<!-- ACTION: ... -->``
-tag from the run output.
+tag from the run output. On a candidate issue it waits instead for the
+squad leader's own verdict once the thread has gone quiet
+(``wait_for_squad_verdict``).
 """
 
 from __future__ import annotations
@@ -143,6 +145,63 @@ class ActionResponse:
     output: str
     run_id: str | None
     completed_at: datetime | None
+
+
+# Run states that can still post to the thread. Anything else — completed,
+# failed, cancelled, or a state this list does not know — reads as finished,
+# so an unfamiliar state cannot hold a verdict back until the deadline; a
+# correction it still posts is caught by the watcher reading on.
+ACTIVE_RUN_STATUSES = frozenset(
+    {"queued", "pending", "dispatched", "claimed", "running", "in_progress"}
+)
+
+
+def _parse_time(raw: Any) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+@dataclass(slots=True, frozen=True)
+class Verdict:
+    """One ACTION tag posted on a squad thread."""
+
+    action: str
+    at: datetime
+    agent_id: str
+    leader: bool
+    run_id: str | None
+    text: str
+
+
+@dataclass(slots=True)
+class SquadThread:
+    """What a squad has said on an issue since the watcher asked.
+
+    The leader is the agent the issue is assigned to — on a candidate issue,
+    the screener. A member it pulls in by mention answers on the same thread,
+    and its tag is advice to the leader, not the squad's verdict: on
+    2026-10-27 the evaluator's REJECT on 한국전력 landed 14 seconds before the
+    screener's own and was the one the watcher took.
+    """
+
+    verdicts: list[Verdict]  # oldest first
+    active_runs: int
+    # The newest leader run that finished, tag or not: the NO_TAG answer
+    # when the leader never posts one.
+    last_leader_run: dict[str, Any] | None = None
+
+    @property
+    def leader_verdicts(self) -> list[Verdict]:
+        return [v for v in self.verdicts if v.leader]
+
+    def final_leader(self) -> Verdict | None:
+        leader = self.leader_verdicts
+        return leader[-1] if leader else None
 
 
 @dataclass(slots=True)
@@ -504,7 +563,9 @@ class MulticaDispatcher:
         )
         return rc == 0
 
-    async def latest_completed_run(self, issue_id: str) -> dict[str, Any] | None:
+    async def list_runs(self, issue_id: str) -> list[dict[str, Any]] | None:
+        """Every run on the issue, or None when the CLI call failed."""
+
         rc, out, _err = await self._run_async(
             ["issue", "runs", issue_id, "--output", "json"]
         )
@@ -512,7 +573,13 @@ class MulticaDispatcher:
             return None
         data = self._parse_json(out)
         runs = data if isinstance(data, list) else (data or {}).get("runs", [])
-        completed = [r for r in runs if isinstance(r, dict) and r.get("status") == "completed"]
+        return [r for r in runs if isinstance(r, dict)]
+
+    async def latest_completed_run(self, issue_id: str) -> dict[str, Any] | None:
+        runs = await self.list_runs(issue_id)
+        if runs is None:
+            return None
+        completed = [r for r in runs if r.get("status") == "completed"]
         if not completed:
             return None
         completed.sort(key=lambda r: r.get("completed_at") or "", reverse=True)
@@ -641,6 +708,152 @@ class MulticaDispatcher:
             if loop.time() >= deadline:
                 return no_tag_response
 
+    async def read_squad_thread(
+        self, issue_id: str, *, since: datetime
+    ) -> SquadThread | None:
+        """Collect the ACTION tags posted on a squad issue since ``since``.
+
+        A tag counts from the comment that carries it, or from its run's
+        output when no comment of that run does. Who said it comes from the
+        run: Multica marks the assignee's runs ``is_leader_task`` and a
+        comment names the run that posted it in ``source_task_id``.
+
+        Returns None when the run list cannot be read — without it nothing
+        can be attributed to the leader.
+        """
+
+        runs = await self.list_runs(issue_id)
+        if runs is None:
+            return None
+        comments = await self.list_comments(issue_id)
+
+        known_runs = {str(r["id"]) for r in runs if r.get("id")}
+        leader_runs = {str(r["id"]) for r in runs if r.get("id") and r.get("is_leader_task")}
+        # By author when the run is not in the list — no `source_task_id`, or
+        # a run that started between the two reads.
+        leader_agents = {
+            str(r["agent_id"]) for r in runs if r.get("agent_id") and r.get("is_leader_task")
+        }
+        verdicts: list[Verdict] = []
+        tagged_runs: set[str] = set()
+        for c in comments:
+            if not isinstance(c, dict) or c.get("author_type") != "agent":
+                continue
+            at = _parse_time(c.get("created_at"))
+            content = c.get("content") or c.get("body") or ""
+            action = extract_action_tag(content) if isinstance(content, str) else "NO_TAG"
+            if at is None or at < since or action not in VALID_ACTIONS:
+                continue
+            run_id = str(c.get("source_task_id") or "") or None
+            agent_id = str(c.get("author_id") or "")
+            if run_id:
+                tagged_runs.add(run_id)
+            verdicts.append(
+                Verdict(
+                    action=action,
+                    at=at,
+                    agent_id=agent_id,
+                    leader=(
+                        run_id in leader_runs
+                        if run_id in known_runs
+                        else agent_id in leader_agents
+                    ),
+                    run_id=run_id,
+                    text=content,
+                )
+            )
+
+        last_leader_run: dict[str, Any] | None = None
+        for r in runs:
+            if r.get("status") != "completed":
+                continue
+            at = _parse_time(r.get("completed_at"))
+            if at is None or at < since:
+                continue
+            if r.get("is_leader_task") and (
+                last_leader_run is None
+                or str(r.get("completed_at")) > str(last_leader_run.get("completed_at"))
+            ):
+                last_leader_run = r
+            output = (r.get("result") or {}).get("output") or ""
+            action = extract_action_tag(output)
+            if action not in VALID_ACTIONS or str(r.get("id")) in tagged_runs:
+                continue
+            verdicts.append(
+                Verdict(
+                    action=action,
+                    at=at,
+                    agent_id=str(r.get("agent_id") or ""),
+                    leader=bool(r.get("is_leader_task")),
+                    run_id=str(r.get("id") or "") or None,
+                    text=output,
+                )
+            )
+
+        verdicts.sort(key=lambda v: v.at)
+        return SquadThread(
+            verdicts=verdicts,
+            active_runs=sum(1 for r in runs if r.get("status") in ACTIVE_RUN_STATUSES),
+            last_leader_run=last_leader_run,
+        )
+
+    async def wait_for_squad_verdict(
+        self,
+        issue_id: str,
+        *,
+        since: datetime,
+        timeout_seconds: int,
+        poll_seconds: int = 10,
+    ) -> ActionResponse | None:
+        """Wait for the squad leader's settled verdict on a squad issue.
+
+        ``wait_for_new_action`` returns the first valid tag from anyone. On a
+        squad issue that is a race: on 2026-10-27 the screener posted a
+        provisional TIER2 on NAVER while the evaluator it had asked was still
+        working, the watcher bought on it, and the screener's REJECT two
+        minutes later was never read (SWO-1105).
+
+        Here only the leader's tags count, and its newest one is returned
+        once no run on the issue is still working. At the deadline the newest
+        leader tag is returned as it stands; the caller keeps reading the
+        thread, so a later correction can still withdraw it.
+
+        Returns:
+            - the leader's newest verdict, settled or at the deadline;
+            - action="NO_TAG" if a leader run finished without one;
+            - None if no leader run finished before the deadline.
+        """
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(timeout_seconds, 1)
+        last: SquadThread | None = None
+        while True:
+            await asyncio.sleep(poll_seconds)
+            thread = await self.read_squad_thread(issue_id, since=since)
+            if thread is not None:
+                last = thread
+                final = thread.final_leader()
+                if final is not None and thread.active_runs == 0:
+                    return _verdict_response(final)
+            if loop.time() >= deadline:
+                break
+
+        if last is None:
+            return None
+        final = last.final_leader()
+        if final is not None:
+            return _verdict_response(final)
+        run = last.last_leader_run
+        if run is None:
+            return None
+        output = (run.get("result") or {}).get("output") or ""
+        return ActionResponse(
+            action=extract_action_tag(output),
+            output=output,
+            run_id=str(run.get("id") or "") or None,
+            completed_at=_parse_time(run.get("completed_at")),
+        )
+
     async def request_peer_review(
         self,
         issue_id: str,
@@ -768,6 +981,15 @@ class MulticaDispatcher:
             await self.update_assignee(issue_id, primary_assignee)
 
 
+def _verdict_response(verdict: Verdict) -> ActionResponse:
+    return ActionResponse(
+        action=verdict.action,
+        output=verdict.text,
+        run_id=verdict.run_id,
+        completed_at=verdict.at,
+    )
+
+
 def extract_action_tag(text: str | None) -> str:
     """Return the ACTION tag embedded in agent output, or ``NO_TAG``."""
 
@@ -785,7 +1007,9 @@ __all__ = [
     "ActionResponse",
     "IssueRef",
     "MulticaDispatcher",
+    "SquadThread",
     "VALID_ACTIONS",
+    "Verdict",
     "extract_action_tag",
     "extract_parent_id",
 ]
