@@ -69,6 +69,7 @@ from .krx_calendar import (
 )
 from .krx_ticks import floor_to_stock_tick
 from .multica_dispatch import (
+    CONSEQUENTIAL_ACTIONS,
     QUOTA_FAILURE_REASON,
     RUN_FAILED,
     ActionResponse,
@@ -89,6 +90,7 @@ from .order_result import (
     EXPOSURE_STATES,
     ORDER_STATE_FAILED,
     ORDER_STATE_FILLED,
+    ORDER_STATE_INFORMATIONAL,
     ORDER_STATE_SUBMITTED,
     ORDER_STATE_UNKNOWN,
     OrderApplyResult,
@@ -500,6 +502,26 @@ class CloseAuctionEntry:
 # ---------------------------------------------------------------------------
 # Watcher
 # ---------------------------------------------------------------------------
+
+
+def _account_read_failure(planner_result: dict[str, Any] | None) -> str | None:
+    """Why this cycle's account read failed, or None if it did not."""
+
+    for entry in (planner_result or {}).get("degraded_sources") or []:
+        if isinstance(entry, dict) and entry.get("source") == "account_evaluation":
+            cause = entry.get("error") or entry.get("return_msg") or "응답 없음"
+            return sanitize_error_detail(str(cause), limit=120)
+    return None
+
+
+def _verdict_excerpt(text: str | None, *, limit: int = 240) -> str | None:
+    """The first line of an agent's verdict, fit for a Discord line."""
+
+    for line in (text or "").splitlines():
+        line = re.sub(r"<!--.*?-->", "", line).replace("**", "").strip()
+        if line and not line.startswith("[@"):
+            return sanitize_error_detail(line, limit=limit)
+    return None
 
 
 def _format_profit_rate(rate: Any) -> str:
@@ -2366,6 +2388,7 @@ class IntradayWatcher:
         action: str,
         result: OrderApplyResult,
         peer_response,
+        verdict_text: str | None = None,
     ) -> None:
         """Push the Tier-2 result to Discord using what the apply really did."""
 
@@ -2422,6 +2445,21 @@ class IntradayWatcher:
             )
         elif result.reason:
             body = f"{target} — {event.reason} · {result.reason}{peer_suffix}"
+        excerpt = _verdict_excerpt(verdict_text)
+        if (
+            result.state == ORDER_STATE_INFORMATIONAL
+            and event.target_role in (ROLE_PM, ROLE_RISK)
+            and action.upper() in CONSEQUENTIAL_ACTIONS
+        ):
+            # A PM or risk call is never executed, so this line is the only
+            # way it reaches anyone. The PM said sell NAVER four times from
+            # 10/28 to 11/02 and Discord carried none of it.
+            await self._notifier.warn(
+                f"{'PM' if event.target_role == ROLE_PM else '리스크'} 권고 (집행 안 됨) · "
+                f"ACTION={action} · {event.trigger_type}",
+                f"{body}" + (f"\n> {excerpt}" if excerpt else ""),
+            )
+            return
         await self._notifier.success(title, body)
 
     # -- tier 2 dispatch -----------------------------------------------------
@@ -2455,13 +2493,19 @@ class IntradayWatcher:
             return
 
         comment = self._build_trigger_comment(event, planner_result)
-        prev_run = await self._dispatcher.latest_completed_run(issue.id)
-        prev_run_id = prev_run.get("id") if prev_run else None
         ok = await self._dispatcher.add_comment(issue.id, comment)
         if not ok:
             log.warning("tier2 comment failed: %s", event.cooldown_key())
             self._status.mark_outcome(
                 entry, outcome="dispatch_failed", detail="comment add failed",
+            )
+            return
+        # A new issue is created unassigned and assigned only now, so the one
+        # run it gets starts with the trigger in the thread.
+        if not await self._dispatcher.assign_pending(issue.id):
+            log.warning("tier2 assignment failed: %s", event.cooldown_key())
+            self._status.mark_outcome(
+                entry, outcome="dispatch_failed", detail="assign failed",
             )
             return
 
@@ -2477,7 +2521,7 @@ class IntradayWatcher:
         )
 
         task = asyncio.create_task(
-            self._await_and_apply(event, entry, issue.id, prev_run_id, planner_result)
+            self._await_and_apply(event, entry, issue.id, planner_result)
         )
         # Last-resort net. `_await_and_apply` handles its own failures, but an
         # exception raised *inside* that handler (or in the `finally`) would
@@ -2577,7 +2621,27 @@ class IntradayWatcher:
 
         portfolio_block = ""
         portfolio = (planner_result or {}).get("portfolio") or {}
-        if portfolio:
+        account_unread = _account_read_failure(planner_result)
+        if portfolio and account_unread is not None:
+            # A failed account read comes back as an empty evaluation, which
+            # the planner turns into zero holdings and zero cash. On
+            # 2026-10-30 14:01 a crash page went out that way — "보유 0종목 ·
+            # 예수금 0" while a holding and its cash were there — with the
+            # zero-holdings rule forbidding every sell (SWO-1124).
+            cand_rows = (planner_result or {}).get("candidate_rows") or []
+            portfolio_block = (
+                "## 포트폴리오 현황\n"
+                "- ⚠️ **계좌 조회 실패 — 보유·미체결·예수금 미확인** "
+                f"({account_unread}). 이번 사이클의 값은 0이 아니라 모르는 값이다.\n"
+                f"- 후보 풀: {len(cand_rows)}건\n\n"
+            )
+            if event.target_role in (ROLE_EVALUATOR, ROLE_PM):
+                portfolio_block += (
+                    "**ACTION 선택 규칙**\n"
+                    "- 보유를 확인하지 못했다. 보유 0을 전제로 판단하지 말고, "
+                    "필요하면 계좌를 직접 다시 조회하라.\n\n"
+                )
+        elif portfolio:
             holdings_n = portfolio.get("holding_count") or 0
             open_orders_n = portfolio.get("open_order_count") or 0
             cash = portfolio.get("cash_available") or 0
@@ -2712,10 +2776,9 @@ class IntradayWatcher:
         event: TriggerEvent,
         entry: TriggerLogEntry,
         issue_id: str,
-        prev_run_id: str | None,
         planner_result: dict[str, Any],
     ) -> None:
-        """Wait for the agent's next run and apply the parsed ACTION.
+        """Wait for the agent's settled verdict and apply its ACTION.
 
         This runs as a detached ``asyncio`` task, so an escaping exception
         would only surface as asyncio's "Task exception was never retrieved"
@@ -2731,21 +2794,14 @@ class IntradayWatcher:
         stage = FAILURE_MULTICA
         stage_label = "agent 응답 대기"
         try:
-            if self._issue_type_for_event(event) == "candidate":
-                response = await self._dispatcher.wait_for_squad_verdict(
-                    issue_id,
-                    since=self._verdict_since(event),
-                    timeout_seconds=self._config.agent_timeout_seconds,
-                    poll_seconds=self._config.agent_poll_seconds,
-                )
-            else:
-                response = await self._dispatcher.wait_for_new_action(
-                    issue_id,
-                    prev_run_id=prev_run_id,
-                    timeout_seconds=self._config.agent_timeout_seconds,
-                    poll_seconds=self._config.agent_poll_seconds,
-                    since=self._verdict_since(event),
-                )
+            # The assignee's final word once its thread is quiet, on every
+            # issue type — see `MulticaDispatcher.wait_for_squad_verdict`.
+            response = await self._dispatcher.wait_for_squad_verdict(
+                issue_id,
+                since=self._verdict_since(event),
+                timeout_seconds=self._config.agent_timeout_seconds,
+                poll_seconds=self._config.agent_poll_seconds,
+            )
             if response is not None and response.action == RUN_FAILED:
                 await self._on_agent_run_failed(event, entry, response)
                 return
@@ -2919,7 +2975,11 @@ class IntradayWatcher:
                     f"final={final_response.action}",
                 )
             await self._notify_tier2_outcome(
-                event, final_response.action, apply_result, peer_response
+                event,
+                final_response.action,
+                apply_result,
+                peer_response,
+                verdict_text=final_response.output,
             )
             if self._issue_type_for_event(event) == "candidate":
                 stage, stage_label = FAILURE_MULTICA, "스크리너 판정 추적"

@@ -459,12 +459,19 @@ SCREENER, EVALUATOR, MEMBER = "agent-screener", "agent-evaluator", "member-1"
 
 
 class _SquadStub(MulticaDispatcher):
-    """Scripted `list_runs` / `list_comments`, one entry per poll."""
+    """Scripted `list_runs` / `list_comments`, one entry per poll.
 
-    def __init__(self, polls):
+    ``assignee`` is the agent the issue is assigned to; None means a squad.
+    """
+
+    def __init__(self, polls, assignee=None):
         super().__init__(project="test-project", binary="/bin/false")
         self._polls = list(polls)
         self._current = ([], [])
+        self._assignee = assignee
+
+    async def _agent_assignee(self, issue_id):  # type: ignore[override]
+        return True, self._assignee
 
     async def list_runs(self, issue_id):  # type: ignore[override]
         if self._polls:
@@ -730,3 +737,172 @@ def test_the_action_wait_gives_up_on_failed_runs_when_told_when_it_asked():
         )
     )
     assert resp is None
+
+
+# -- one run per trigger ---------------------------------------------------------
+#
+# An issue created assigned started a run at once, and the trigger comment a
+# second later started another. Multica runs one agent's tasks on an issue in
+# turn, so the second waited for the first and mostly wrote "already handled"
+# (33 runs from 2026-10-13 to 11-04). Created unassigned, then assigned after
+# the comment, an issue gets one run that has the trigger to read — checked
+# against the live server on 11/04 (SWO-1160 agent, SWO-1161 squad).
+
+DAY = datetime(2026, 11, 5, 9, 0, tzinfo=timezone.utc)
+
+
+class _CliSpy(MulticaDispatcher):
+    """Records every CLI call and answers the way the server does."""
+
+    def __init__(self, listed=(), refuse_update=0):
+        super().__init__(project="test-project", binary="/bin/false")
+        self.calls = []
+        self.listed = list(listed)
+        self.created = 0
+        self.refuse_update = refuse_update
+
+    async def _run_async(self, args, stdin=None):  # type: ignore[override]
+        self.calls.append(list(args))
+        if args[:2] == ["issue", "list"]:
+            return 0, json.dumps({"issues": self.listed}), ""
+        if args[:2] == ["issue", "create"]:
+            self.created += 1
+            return 0, json.dumps({"id": f"new-{self.created}", "assignee_id": None}), ""
+        if args[:2] == ["issue", "update"] and self.refuse_update:
+            self.refuse_update -= 1
+            return 1, "", "boom"
+        if args[:3] == ["issue", "comment", "list"]:
+            return 0, json.dumps({"comments": []}), ""
+        return 0, "{}", ""
+
+    def assignments(self):
+        return [(c[2], c[c.index("--assignee") + 1]) for c in self.calls if c[:2] == ["issue", "update"]]
+
+
+def _listed(issue_id, title, assignee=None):
+    """An `issue list` row with the keys the server sends."""
+
+    return {"id": issue_id, "title": title, "status": "todo", "parent_issue_id": None,
+            "assignee_type": "agent" if assignee else None, "assignee_id": assignee}
+
+
+def test_a_new_issue_is_assigned_only_after_its_trigger_comment():
+    spy = _CliSpy()
+
+    async def dispatch():
+        ref = await spy.ensure_candidate_issue(code="105560", name="KB금융", now=DAY)
+        assert spy.assignments() == [], "creating it must not start a run"
+        await spy.add_comment(ref.id, "트리거")
+        assert await spy.assign_pending(ref.id)
+        assert await spy.assign_pending(ref.id), "nothing left to assign"
+        again = await spy.ensure_candidate_issue(code="105560", name="KB금융", now=DAY)
+        assert await spy.assign_pending(again.id)
+        return ref
+
+    ref = asyncio.run(dispatch())
+
+    creates = [c for c in spy.calls if c[:2] == ["issue", "create"]]
+    assert len(creates) == 2 and all("--assignee" not in c for c in creates)
+    assert spy.assignments() == [(ref.id, "후보 스크리너 스쿼드 (실거래)")]
+    order = [c[:3] for c in spy.calls if c[:2] in (["issue", "comment"], ["issue", "update"])]
+    assert order == [["issue", "comment", "add"], ["issue", "update", ref.id]]
+
+
+def test_the_daily_parent_is_never_assigned():
+    spy = _CliSpy()
+
+    async def dispatch():
+        parent = await spy.ensure_daily_issue(now=DAY)
+        assert await spy.assign_pending(parent.id)
+        return parent
+
+    asyncio.run(dispatch())
+
+    assert spy.assignments() == []
+
+
+def test_an_unassigned_issue_found_after_a_restart_is_assigned_after_its_comment():
+    title = "[KB금융] (A105560) 2026-11-05 보유 분석"
+    spy = _CliSpy(listed=[_listed("parent", "2026-11-05 장중 실거래"), _listed("kb", title)])
+
+    async def dispatch():
+        ref = await spy.ensure_holding_issue(code="A105560", name="KB금융", now=DAY)
+        assert ref.id == "kb"
+        await spy.add_comment(ref.id, "트리거")
+        assert await spy.assign_pending(ref.id)
+
+    asyncio.run(dispatch())
+
+    assert spy.assignments() == [("kb", "투자 평가사 (실거래)")]
+
+
+def test_an_assigned_issue_found_after_a_restart_is_left_alone():
+    title = "[KB금융] (A105560) 2026-11-05 보유 분석"
+    spy = _CliSpy(listed=[_listed("parent", "2026-11-05 장중 실거래"), _listed("kb", title, assignee="agent-evaluator")])
+
+    async def dispatch():
+        ref = await spy.ensure_holding_issue(code="A105560", name="KB금융", now=DAY)
+        await spy.add_comment(ref.id, "트리거")
+        assert await spy.assign_pending(ref.id)
+
+    asyncio.run(dispatch())
+
+    assert spy.assignments() == [], "a second assignment would start a second run"
+
+
+def test_a_refused_assignment_stays_due_for_the_next_trigger():
+    spy = _CliSpy(refuse_update=1)
+
+    async def dispatch():
+        ref = await spy.ensure_candidate_issue(code="105560", name="KB금융", now=DAY)
+        assert not await spy.assign_pending(ref.id)
+        assert await spy.assign_pending(ref.id)
+        return ref
+
+    ref = asyncio.run(dispatch())
+
+    assert spy.assignments() == [(ref.id, "후보 스크리너 스쿼드 (실거래)")] * 2
+
+
+# -- the assignee's final verdict on an issue assigned to one agent --------------
+#
+# 2026-10-30 10:10 KST NAVER holding_swing (SWO-1125): the evaluator said HOLD,
+# re-read the quote a minute later, saw the 20-day low break and posted
+# CUT_LOSS. The watcher had taken the HOLD. Holding issues are assigned to the
+# evaluator directly, so Multica marks none of its runs `is_leader_task`.
+
+RISK = "agent-risk"
+HOLD_SINCE = datetime(2026, 10, 30, 1, 9, 49, tzinfo=timezone.utc)
+HOLD_TRIGGER = _squad_comment(MEMBER, "2026-10-30T01:10:25Z", "트리거\n<!-- ACTION: XXX -->")
+FIRST_HOLD = _squad_comment(EVALUATOR, "2026-10-30T01:11:38Z", "NAVER: HOLD\n<!-- ACTION: HOLD -->", "A")
+LATER_CUT = _squad_comment(EVALUATOR, "2026-10-30T01:12:20Z", "NAVER: CUT_LOSS로 변경\n<!-- ACTION: CUT_LOSS -->", "B")
+HOLD_RUN_A = _squad_run("A", EVALUATOR, completed_at="2026-10-30T01:11:45Z", output="HOLD를 남겼습니다.")
+
+
+def test_on_an_agent_issue_the_assignees_newest_verdict_is_taken_once_settled():
+    stub = _SquadStub(
+        [
+            ([HOLD_RUN_A, _squad_run("B", EVALUATOR, status="running")], [HOLD_TRIGGER, FIRST_HOLD]),
+            (
+                [HOLD_RUN_A, _squad_run("B", EVALUATOR, completed_at="2026-10-30T01:12:26Z", output="CUT_LOSS")],
+                [HOLD_TRIGGER, FIRST_HOLD, LATER_CUT],
+            ),
+        ],
+        assignee=EVALUATOR,
+    )
+
+    resp = _wait(stub, timeout=60.0, since=HOLD_SINCE)
+
+    assert resp is not None and resp.action == "CUT_LOSS" and resp.run_id == "B"
+
+
+def test_on_an_agent_issue_a_reviewers_tag_is_not_the_verdict():
+    review = _squad_comment(RISK, "2026-10-30T01:12:40Z", "반대\n<!-- ACTION: CUT_LOSS -->", "R")
+    stub = _SquadStub(
+        [([HOLD_RUN_A, _squad_run("R", RISK, completed_at="2026-10-30T01:12:44Z")], [HOLD_TRIGGER, FIRST_HOLD, review])],
+        assignee=EVALUATOR,
+    )
+
+    resp = _wait(stub, timeout=60.0, since=HOLD_SINCE)
+
+    assert resp is not None and resp.action == "HOLD" and resp.run_id == "A"

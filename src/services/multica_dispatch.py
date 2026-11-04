@@ -256,6 +256,8 @@ class IssueRef:
     id: str
     title: str
     parent_id: str | None = None
+    # False while the issue waits for its assignee — see `assign_pending`.
+    assigned: bool = True
 
 
 def extract_parent_id(issue: dict[str, Any]) -> str | None:
@@ -297,6 +299,8 @@ class MulticaDispatcher:
         self._issue_cache: dict[str, IssueRef] = {}
         # issue id -> comments this process has posted there, for rollover.
         self._comment_counts: dict[str, int] = {}
+        # issue id -> who to assign once its first trigger comment is up.
+        self._pending_assignee: dict[str, str] = {}
 
     # -- low-level CLI helpers ------------------------------------------------
 
@@ -356,6 +360,7 @@ class MulticaDispatcher:
                     id=str(issue.get("id") or ""),
                     title=t,
                     parent_id=extract_parent_id(issue),
+                    assigned=bool(issue.get("assignee_id")),
                 )
                 if ref.id:
                     self._issue_cache[title] = ref
@@ -371,7 +376,17 @@ class MulticaDispatcher:
         parent_id: str | None = None,
         priority: str = "medium",
     ) -> IssueRef | None:
-        assignee = self.agent_for.get(issue_type, self.agent_for["daily"])
+        """Create an issue with no assignee.
+
+        Creating it assigned started a run at once, and the trigger comment
+        posted a second later started another, so every new issue cost two
+        runs. Multica runs an agent's tasks on one issue in turn: the second
+        waited out the first (an evaluator 122-198s on 2026-10-14~29) and
+        mostly reported "already handled" — 33 such runs from 10/13 to 11/04.
+        The caller assigns it with `assign_pending` once the comment is up,
+        so the one run it gets has the trigger to read.
+        """
+
         args = [
             "issue",
             "create",
@@ -381,8 +396,6 @@ class MulticaDispatcher:
             title,
             "--description",
             description,
-            "--assignee",
-            assignee,
             "--priority",
             priority,
             "--output",
@@ -395,10 +408,37 @@ class MulticaDispatcher:
             return None
         data = self._parse_json(out)
         if isinstance(data, dict) and data.get("id"):
-            ref = IssueRef(id=str(data["id"]), title=title)
+            ref = IssueRef(id=str(data["id"]), title=title, assigned=False)
             self._issue_cache[title] = ref
             return ref
         return None
+
+    def _defer_assignment(self, ref: IssueRef | None, issue_type: str) -> IssueRef | None:
+        """Queue an unassigned issue for its assignee's run."""
+
+        if ref is not None and not ref.assigned:
+            self._pending_assignee[ref.id] = self.agent_for.get(
+                issue_type, self.agent_for["daily"]
+            )
+        return ref
+
+    async def assign_pending(self, issue_id: str) -> bool:
+        """Assign an issue that is waiting for it, after its trigger comment.
+
+        Returns False only when an assignment was due and the CLI refused it;
+        the issue then stays queued, so the next trigger tries again.
+        """
+
+        assignee = self._pending_assignee.get(issue_id)
+        if assignee is None:
+            return True
+        if not await self.update_assignee(issue_id, assignee):
+            return False
+        del self._pending_assignee[issue_id]
+        for ref in self._issue_cache.values():
+            if ref.id == issue_id:
+                ref.assigned = True
+        return True
 
     async def ensure_daily_issue(self, *, now: datetime | None = None) -> IssueRef | None:
         title = f"{_today_str(now)} {self.daily_suffix}"
@@ -410,6 +450,9 @@ class MulticaDispatcher:
             "보유 종목별 개별 분석은 자식 이슈로 연결되며, "
             "포트폴리오 매니저가 사이클 판단 및 daily-wrap을 담당합니다."
         )
+        # A container: no trigger is posted here, so it is never assigned. An
+        # assigned parent cost a PM run every morning with nothing to judge,
+        # and another each time a child closed (`child_done`).
         return await self._create_issue(
             title=title, description=desc, issue_type="daily", priority="medium"
         )
@@ -441,18 +484,21 @@ class MulticaDispatcher:
         title = f"[{name}] ({code}) {_today_str(now)} 후보 평가"
         existing = await self._find_by_title(title)
         if existing is not None:
-            return existing
+            return self._defer_assignment(existing, "candidate")
         desc = (
             f"종목: {name} ({code})\n일자: {_today_str(now)}\n\n"
             "Watcher가 신규 강한 후보를 감지하면 이 이슈에 코멘트로 의견을 요청합니다. "
             "스크리너는 ACTION 태그(TIER1/TIER2/REJECT)로 응답합니다."
         )
-        return await self._create_issue(
-            title=title,
-            description=desc,
-            issue_type="candidate",
-            parent_id=daily.id,
-            priority="medium",
+        return self._defer_assignment(
+            await self._create_issue(
+                title=title,
+                description=desc,
+                issue_type="candidate",
+                parent_id=daily.id,
+                priority="medium",
+            ),
+            "candidate",
         )
 
     async def ensure_pm_log_issue(self, *, now: datetime | None = None) -> IssueRef | None:
@@ -485,18 +531,21 @@ class MulticaDispatcher:
         title = f"[리스크] {_today_str(now)} 리스크 알림"
         existing = await self._find_by_title(title)
         if existing is not None:
-            return existing
+            return self._defer_assignment(existing, "incident")
         desc = (
             "Watcher가 인프라/체결/API 헬스 트리거를 감지할 때 "
             "이 이슈에 코멘트로 리스크 매니저 판단을 요청합니다. "
             "ACTION 태그(ACKNOWLEDGE/MITIGATE/ESCALATE)로 응답합니다."
         )
-        return await self._create_issue(
-            title=title,
-            description=desc,
-            issue_type="incident",
-            parent_id=daily.id,
-            priority="high",
+        return self._defer_assignment(
+            await self._create_issue(
+                title=title,
+                description=desc,
+                issue_type="incident",
+                parent_id=daily.id,
+                priority="high",
+            ),
+            "incident",
         )
 
     # -- comments + run polling ---------------------------------------------
@@ -583,15 +632,18 @@ class MulticaDispatcher:
             title = base_title if part == 1 else f"{base_title} ({part})"
             existing = await self._find_by_title(title)
             if existing is None:
-                return await self._create_issue(
-                    title=title,
-                    description=description,
-                    issue_type=issue_type,
-                    parent_id=parent_id,
-                    priority=priority,
+                return self._defer_assignment(
+                    await self._create_issue(
+                        title=title,
+                        description=description,
+                        issue_type=issue_type,
+                        parent_id=parent_id,
+                        priority=priority,
+                    ),
+                    issue_type,
                 )
             if not await self._needs_rollover(existing):
-                return existing
+                return self._defer_assignment(existing, issue_type)
         return None
 
     async def update_assignee(self, issue_id: str, assignee: str) -> bool:
@@ -767,14 +819,16 @@ class MulticaDispatcher:
                 return no_tag_response
 
     async def read_squad_thread(
-        self, issue_id: str, *, since: datetime
+        self, issue_id: str, *, since: datetime, leader_agent_id: str | None = None
     ) -> SquadThread | None:
-        """Collect the ACTION tags posted on a squad issue since ``since``.
+        """Collect the ACTION tags posted on an issue since ``since``.
 
         A tag counts from the comment that carries it, or from its run's
         output when no comment of that run does. Who said it comes from the
-        run: Multica marks the assignee's runs ``is_leader_task`` and a
-        comment names the run that posted it in ``source_task_id``.
+        run: on a squad issue Multica marks the leader's runs
+        ``is_leader_task``; on an issue assigned to one agent nothing is
+        marked, so ``leader_agent_id`` names the assignee. A comment names the
+        run that posted it in ``source_task_id``.
 
         Returns None when the run list cannot be read — without it nothing
         can be attributed to the leader.
@@ -785,13 +839,18 @@ class MulticaDispatcher:
             return None
         comments = await self.list_comments(issue_id)
 
+        def is_leader(run: dict[str, Any]) -> bool:
+            return bool(run.get("is_leader_task")) or (
+                leader_agent_id is not None and str(run.get("agent_id") or "") == leader_agent_id
+            )
+
         known_runs = {str(r["id"]) for r in runs if r.get("id")}
-        leader_runs = {str(r["id"]) for r in runs if r.get("id") and r.get("is_leader_task")}
+        leader_runs = {str(r["id"]) for r in runs if r.get("id") and is_leader(r)}
         # By author when the run is not in the list — no `source_task_id`, or
         # a run that started between the two reads.
-        leader_agents = {
-            str(r["agent_id"]) for r in runs if r.get("agent_id") and r.get("is_leader_task")
-        }
+        leader_agents = {str(r["agent_id"]) for r in runs if r.get("agent_id") and is_leader(r)}
+        if leader_agent_id is not None:
+            leader_agents.add(leader_agent_id)
         verdicts: list[Verdict] = []
         tagged_runs: set[str] = set()
         for c in comments:
@@ -828,7 +887,7 @@ class MulticaDispatcher:
             at = _parse_time(r.get("completed_at"))
             if at is None or at < since:
                 continue
-            if r.get("is_leader_task") and (
+            if is_leader(r) and (
                 last_leader_run is None
                 or str(r.get("completed_at")) > str(last_leader_run.get("completed_at"))
             ):
@@ -842,7 +901,7 @@ class MulticaDispatcher:
                     action=action,
                     at=at,
                     agent_id=str(r.get("agent_id") or ""),
-                    leader=bool(r.get("is_leader_task")),
+                    leader=is_leader(r),
                     run_id=str(r.get("id") or "") or None,
                     text=output,
                 )
@@ -856,6 +915,20 @@ class MulticaDispatcher:
             failed_run=failed_dispatch(runs, since),
         )
 
+    async def _agent_assignee(self, issue_id: str) -> tuple[bool, str | None]:
+        """(read ok, agent id) of the issue's assignee; the id only for an agent.
+
+        A squad assignee leaves the id None: its leader is marked on its runs.
+        """
+
+        rc, out, _err = await self._run_async(["issue", "get", issue_id, "--output", "json"])
+        data = self._parse_json(out) if rc == 0 else None
+        if not isinstance(data, dict):
+            return False, None
+        if data.get("assignee_type") == "agent" and data.get("assignee_id"):
+            return True, str(data["assignee_id"])
+        return True, None
+
     async def wait_for_squad_verdict(
         self,
         issue_id: str,
@@ -864,7 +937,7 @@ class MulticaDispatcher:
         timeout_seconds: int,
         poll_seconds: int = 10,
     ) -> ActionResponse | None:
-        """Wait for the squad leader's settled verdict on a squad issue.
+        """Wait for the assignee's settled verdict on an issue.
 
         ``wait_for_new_action`` returns the first valid tag from anyone. On a
         squad issue that is a race: on 2026-10-27 the screener posted a
@@ -874,8 +947,15 @@ class MulticaDispatcher:
 
         Here only the leader's tags count, and its newest one is returned
         once no run on the issue is still working. At the deadline the newest
-        leader tag is returned as it stands; the caller keeps reading the
-        thread, so a later correction can still withdraw it.
+        leader tag is returned as it stands; on a candidate the caller keeps
+        reading the thread, so a later correction can still withdraw it.
+
+        Every dispatch waits this way (2026-11-04). The first-tag race was not
+        the screener's alone: the evaluator twice turned a HOLD into CUT_LOSS a
+        minute later (10/13 셀트리온, 10/30 NAVER) and the HOLD was what ran, and
+        the PM's final sell calls after a delegation never reached Discord
+        because its interim ACKNOWLEDGE was taken instead. On an issue
+        assigned to one agent (holding, incident) that agent is the leader.
 
         Returns:
             - the leader's newest verdict, settled or at the deadline;
@@ -888,9 +968,15 @@ class MulticaDispatcher:
         deadline = loop.time() + max(timeout_seconds, 1)
         last: SquadThread | None = None
         failed_polls = 0
+        leader_agent_id: str | None = None
+        assignee_known = False
         while True:
             await asyncio.sleep(poll_seconds)
-            thread = await self.read_squad_thread(issue_id, since=since)
+            if not assignee_known:
+                assignee_known, leader_agent_id = await self._agent_assignee(issue_id)
+            thread = await self.read_squad_thread(
+                issue_id, since=since, leader_agent_id=leader_agent_id
+            )
             if thread is not None:
                 last = thread
                 final = thread.final_leader()
@@ -1071,6 +1157,7 @@ def extract_action_tag(text: str | None) -> str:
 
 __all__ = [
     "ActionResponse",
+    "CONSEQUENTIAL_ACTIONS",
     "IssueRef",
     "MulticaDispatcher",
     "QUOTA_FAILURE_REASON",

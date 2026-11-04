@@ -128,6 +128,9 @@ class StubDispatcher:
         self.comments.append((issue_id, content))
         return True
 
+    async def assign_pending(self, issue_id):
+        return True
+
     async def latest_completed_run(self, issue_id):
         return None
 
@@ -1041,7 +1044,7 @@ def test_await_and_apply_records_real_order_state(monkeypatch):
     entry = _entry_for(event)
     planner = {"portfolio": {"position_budget": 100_000, "max_positions": 3}}
 
-    asyncio.run(w._await_and_apply(event, entry, "candidate-1", None, planner))
+    asyncio.run(w._await_and_apply(event, entry, "candidate-1", planner))
 
     assert entry.action == "TIER1"
     assert entry.outcome == "failed"
@@ -1067,7 +1070,7 @@ def test_await_and_apply_records_submitted_for_accepted_buy(monkeypatch):
     entry = _entry_for(event)
     planner = {"portfolio": {"position_budget": 100_000, "max_positions": 3}}
 
-    asyncio.run(w._await_and_apply(event, entry, "candidate-1", None, planner))
+    asyncio.run(w._await_and_apply(event, entry, "candidate-1", planner))
 
     assert entry.outcome == "submitted"
     assert "order_no=55" in (entry.detail or "")
@@ -1215,7 +1218,7 @@ def test_tier2_records_peer_review_mismatch(monkeypatch):
     event = _holding_event()
     entry = _entry_for(event)
 
-    asyncio.run(w._await_and_apply(event, entry, "holding-1", None, {}))
+    asyncio.run(w._await_and_apply(event, entry, "holding-1", {}))
 
     assert entry.action == "TRIM"
     assert "peer_review=CUT_LOSS" in (entry.detail or "")
@@ -1485,7 +1488,7 @@ def test_dispatcher_exception_marks_failed_and_releases_lock():
         issue_id="holding-1",
     )
 
-    asyncio.run(w._await_and_apply(event, entry, "holding-1", None, {}))
+    asyncio.run(w._await_and_apply(event, entry, "holding-1", {}))
 
     assert entry.outcome == "failed"
     assert "multica CLI exited 1" in (entry.detail or "")
@@ -1512,7 +1515,7 @@ def test_stale_quote_exception_marks_failed_and_places_no_order(monkeypatch):
     event = _holding_event()
     entry = _entry_for(event)
 
-    asyncio.run(w._await_and_apply(event, entry, "holding-1", None, {}))
+    asyncio.run(w._await_and_apply(event, entry, "holding-1", {}))
 
     assert entry.outcome == "failed"
     assert _failure_count(w, "market") == 1
@@ -1538,7 +1541,7 @@ def test_peer_review_exception_does_not_kill_the_trigger(monkeypatch):
     event = _holding_event()
     entry = _entry_for(event)
 
-    asyncio.run(w._await_and_apply(event, entry, "holding-1", None, {}))
+    asyncio.run(w._await_and_apply(event, entry, "holding-1", {}))
 
     # Primary ACTION still applied; only the review degraded.
     assert entry.outcome == "submitted"
@@ -1557,7 +1560,7 @@ def test_order_apply_exception_marks_failed_and_releases_lock(monkeypatch):
     event = _holding_event()
     entry = _entry_for(event)
 
-    asyncio.run(w._await_and_apply(event, entry, "holding-1", None, {}))
+    asyncio.run(w._await_and_apply(event, entry, "holding-1", {}))
 
     assert entry.outcome == "failed"
     assert _failure_count(w, "order") == 1
@@ -1571,7 +1574,7 @@ def test_same_scope_dispatches_again_after_a_failure():
     w = _build_watcher(dispatcher=BoomDispatcher(), config=_config(cooldown_seconds=0))
     event = _holding_event()
 
-    asyncio.run(w._await_and_apply(event, _entry_for(event), "holding-1", None, {}))
+    asyncio.run(w._await_and_apply(event, _entry_for(event), "holding-1", {}))
     assert w._in_flight == {}
 
     # The scope is free, so the very next fire dispatches normally.
@@ -1599,7 +1602,7 @@ def test_cancellation_is_recorded_separately_from_failure():
     async def driver():
         w.stop()  # simulate shutdown having been requested
         task = asyncio.create_task(
-            w._await_and_apply(event, entry, "holding-1", None, {})
+            w._await_and_apply(event, entry, "holding-1", {})
         )
         await asyncio.sleep(0)
         task.cancel()
@@ -1858,7 +1861,7 @@ def test_a_submitted_order_is_never_relabelled_failed(monkeypatch):
     event = _holding_event()
     entry = _entry_for(event)
 
-    asyncio.run(w._await_and_apply(event, entry, "holding-1", None, {}))
+    asyncio.run(w._await_and_apply(event, entry, "holding-1", {}))
 
     assert entry.outcome == "submitted"  # not "failed"
     # The fault is still counted (stage attribution is coarse — the apply
@@ -4865,6 +4868,174 @@ def test_an_answer_after_the_pause_lifts_it():
     assert "7건" in w._notifier.calls[0][2]
 
 
+# -- every dispatch takes the assignee's final verdict ------------------------------
+#
+# 2026-11-04 review: the candidate fix (SWO-1105) left the holding and PM paths
+# on the first tag. The evaluator twice turned a HOLD into CUT_LOSS a minute
+# later and the HOLD ran (10/13 셀트리온, 10/30 NAVER); the PM's final sell
+# calls after a delegation never reached Discord (NAVER 10/28~11/02).
+
+
+class _WaitRecorder(StubDispatcher):
+    """Answers like StubDispatcher and notes which wait each dispatch used."""
+
+    def __init__(self, *, action="HOLD", output=None):
+        super().__init__(action=action)
+        self.waits: list[str] = []
+        self.calls: list[str] = []
+        self._output = output
+        self.assign_ok = True
+
+    async def add_comment(self, issue_id, content):
+        self.calls.append("comment")
+        return await super().add_comment(issue_id, content)
+
+    async def assign_pending(self, issue_id):
+        self.calls.append("assign")
+        return self.assign_ok
+
+    async def wait_for_new_action(self, issue_id, **kwargs):
+        self.waits.append("first_tag")
+        return await super().wait_for_new_action(issue_id, **kwargs)
+
+    async def wait_for_squad_verdict(self, issue_id, *, since, timeout_seconds, poll_seconds=10):
+        self.waits.append("final")
+        if self._action is None:
+            return None
+        return ActionResponse(
+            action=self._action,
+            output=self._output or f"<!-- ACTION: {self._action} -->",
+            run_id="run-1",
+            completed_at=None,
+        )
+
+
+def _risk_event():
+    return TriggerEvent(
+        trigger_type="api_failures", tier=2, scope="global", target_role=watcher_module.ROLE_RISK,
+        stock_code=None, stock_name=None, snapshot={}, detected_at=datetime.now(KST), reason="조회 실패",
+    )
+
+
+@pytest.mark.parametrize(
+    "event_factory",
+    [lambda: _holding_event(), lambda: _pm_event("periodic_review"), _risk_event],
+    ids=["holding", "pm", "incident"],
+)
+def test_every_dispatch_waits_for_the_assignees_final_verdict(event_factory):
+    dispatcher = _WaitRecorder(action="HOLD")
+    w = _build_watcher(dispatcher=dispatcher)
+
+    async def driver():
+        await w._handle_trigger(event_factory(), planner_result={})
+        for slot in list(w._in_flight.values()):
+            await slot.task
+
+    asyncio.run(driver())
+
+    assert dispatcher.waits == ["final"]
+
+
+def test_a_new_issue_is_assigned_after_its_trigger_comment():
+    dispatcher = _WaitRecorder()
+    w = _build_watcher(dispatcher=dispatcher)
+
+    async def driver():
+        await w._handle_trigger(_holding_event(), planner_result={})
+        for slot in list(w._in_flight.values()):
+            await slot.task
+
+    asyncio.run(driver())
+
+    assert dispatcher.calls[:2] == ["comment", "assign"]
+
+
+def test_a_refused_assignment_is_a_failed_dispatch():
+    dispatcher = _WaitRecorder()
+    dispatcher.assign_ok = False
+    w = _build_watcher(dispatcher=dispatcher)
+
+    asyncio.run(w._handle_trigger(_holding_event(), planner_result={}))
+
+    assert w._in_flight == {}
+    assert dispatcher.waits == [], "no run was started, so there is nothing to wait for"
+    assert w._status.recent()[0]["outcome"] == "dispatch_failed"
+
+
+PM_FINAL_SELL = (
+    "평가사의 09:02:14 조회를 근거로 NAVER 1주 잠정 HOLD를 CUT_LOSS 권고로 변경합니다. "
+    "현재가 170,200원·MA20 대비 4.94% 하회.\n\n<!-- ACTION: CUT_LOSS -->"
+)
+
+
+def test_a_pm_sell_call_reaches_discord_with_what_it_recommends():
+    """11/02 09:00 periodic_review (SWO-1131): the PM's final word was CUT_LOSS."""
+
+    dispatcher = _WaitRecorder(action="CUT_LOSS", output=PM_FINAL_SELL)
+    w = _build_watcher(dispatcher=dispatcher)
+
+    async def driver():
+        await w._handle_trigger(_pm_event("periodic_review"), planner_result={})
+        for slot in list(w._in_flight.values()):
+            await slot.task
+
+    asyncio.run(driver())
+
+    warns = [c for c in w._notifier.calls if c[0] == "warn" and "PM 권고" in c[1]]
+    assert len(warns) == 1
+    assert "집행 안 됨" in warns[0][1] and "CUT_LOSS" in warns[0][1]
+    assert "NAVER 1주 잠정 HOLD를 CUT_LOSS 권고로 변경" in warns[0][2]
+    assert "ACTION:" not in warns[0][2]
+
+
+def test_a_routine_pm_hold_still_stays_off_discord():
+    dispatcher = _WaitRecorder(action="HOLD", output="두 종목 모두 HOLD.\n<!-- ACTION: HOLD -->")
+    w = _build_watcher(dispatcher=dispatcher)
+
+    async def driver():
+        await w._handle_trigger(_pm_event("periodic_review"), planner_result={})
+        for slot in list(w._in_flight.values()):
+            await slot.task
+
+    asyncio.run(driver())
+
+    assert not [c for c in w._notifier.calls if c[0] in ("warn", "success")]
+
+
+def _planner_with_unread_account():
+    """2026-10-30 14:01: the index read recovered, the account read timed out."""
+
+    return {
+        "portfolio": {"holding_count": 0, "open_order_count": 0, "cash_available": 0,
+                      "cash_d2": 0, "estimated_assets": 0},
+        "holdings": [],
+        "candidate_rows": [{"stock_code": "000660"}] * 30,
+        "degraded_sources": [{"source": "account_evaluation", "error": "ConnectTimeout: "}],
+    }
+
+
+def test_the_trigger_comment_says_the_account_is_unread_rather_than_empty():
+    w = _build_watcher()
+
+    comment = w._build_trigger_comment(_pm_event("extreme_risk_off"), _planner_with_unread_account())
+
+    assert "계좌 조회 실패" in comment and "ConnectTimeout" in comment
+    assert "보유: **0종목**" not in comment
+    assert "예수금(당일): 0원" not in comment
+    assert "보유 0종목: `TRIM`" not in comment, "the zero-holdings rule forbade every sell"
+    assert "후보 풀: 30건" in comment
+
+
+def test_a_genuinely_empty_account_still_reads_as_empty():
+    w = _build_watcher()
+    planner = _planner_with_unread_account()
+    planner["degraded_sources"] = []
+
+    comment = w._build_trigger_comment(_pm_event("periodic_review"), planner)
+
+    assert "보유: **0종목**" in comment and "계좌 조회 실패" not in comment
+
+
 def _candidate_row(code, *, score, eligible, name=None):
     return {
         "stock_code": code,
@@ -5656,7 +5827,7 @@ def test_candidate_peer_rejection_without_arbitration_blocks_buy(monkeypatch):
     event = _candidate_event()
     event.snapshot["current_price"] = 10000
     entry = _entry_for(event)
-    asyncio.run(watcher._await_and_apply(event, entry, "candidate-1", None, {}))
+    asyncio.run(watcher._await_and_apply(event, entry, "candidate-1", {}))
     assert entry.outcome == "skipped"
     assert "중재 미확정" in entry.detail
     assert watcher._ledger.recent() == []
@@ -6757,7 +6928,7 @@ def test_naver_replay_a_retracted_auction_buy_is_cancelled(monkeypatch, tmp_path
     event = _auction_candidate(detected_at=_at(15, 18, 49))
     entry = _entry_for(event)
 
-    asyncio.run(w._await_and_apply(event, entry, "candidate-1", None, _AUCTION_PLANNER))
+    asyncio.run(w._await_and_apply(event, entry, "candidate-1", _AUCTION_PLANNER))
 
     # The provisional TIER2 still went in — that is what the screener said
     # when its thread went quiet — and was then taken back.
@@ -6792,7 +6963,7 @@ def test_a_retraction_before_the_auction_drops_the_held_entry(monkeypatch, tmp_p
     w = _follow_watcher(_at(14, 55, 30), d, tmp_path)
     event = _auction_candidate(detected_at=_at(14, 54, 30))
 
-    asyncio.run(w._await_and_apply(event, _entry_for(event), "candidate-1", None, _AUCTION_PLANNER))
+    asyncio.run(w._await_and_apply(event, _entry_for(event), "candidate-1", _AUCTION_PLANNER))
 
     assert w._close_auction_entries == {}
     assert w.status.snapshot()["close_auction_entries"] == []
@@ -6844,7 +7015,7 @@ def test_a_late_approval_after_a_reject_buys_nothing(monkeypatch, tmp_path):
     w = _follow_watcher(_at(14, 55, 30), d, tmp_path)
     event = _auction_candidate(detected_at=_at(14, 54, 30))
 
-    asyncio.run(w._await_and_apply(event, _entry_for(event), "candidate-1", None, _AUCTION_PLANNER))
+    asyncio.run(w._await_and_apply(event, _entry_for(event), "candidate-1", _AUCTION_PLANNER))
     _move_clock(w, _at(15, 21))
     asyncio.run(w._submit_close_auction_entries(_AUCTION_PLANNER))
 
@@ -6862,7 +7033,7 @@ def test_a_retraction_read_after_the_close_cancels_nothing(monkeypatch, tmp_path
     w = _follow_watcher(_at(15, 22, 10), d, tmp_path)
     event = _auction_candidate(detected_at=_at(15, 21))
 
-    asyncio.run(w._await_and_apply(event, _entry_for(event), "candidate-1", None, _AUCTION_PLANNER))
+    asyncio.run(w._await_and_apply(event, _entry_for(event), "candidate-1", _AUCTION_PLANNER))
 
     assert len(buys) == 1
     assert cancels == []
@@ -6879,7 +7050,7 @@ def test_a_refused_cancel_pages_that_the_buy_may_still_fill(monkeypatch, tmp_pat
     w = _follow_watcher(_at(15, 22, 10), d, tmp_path)
     event = _auction_candidate(detected_at=_at(15, 21))
 
-    asyncio.run(w._await_and_apply(event, _entry_for(event), "candidate-1", None, _AUCTION_PLANNER))
+    asyncio.run(w._await_and_apply(event, _entry_for(event), "candidate-1", _AUCTION_PLANNER))
 
     assert any(
         kind == "error" and "취소 실패" in title for kind, title, _ in w._notifier.calls
