@@ -624,3 +624,109 @@ def test_squad_thread_attributes_tags_and_skips_what_came_before():
     ]
     assert thread.final_leader().action == "REJECT"
     assert thread.active_runs == 0
+
+
+# -- a dispatch whose runs all fail ------------------------------------------
+#
+# 2026-11-04 14:14 KST, SK하이닉스 new_candidate: the codex quota was spent,
+# so the assignment run and the trigger comment's run both failed within
+# seconds — and the wait sat out its 300s for a verdict that could not come.
+
+QUOTA_ERROR = (
+    "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+    "visit https://chatgpt.com/settings/usage to purchase more credits or try again at 3:40 PM."
+)
+REFUSED_SINCE = datetime(2026, 11, 4, 6, 13, 38, tzinfo=timezone.utc)
+
+
+def _failed_run(run_id, created_at, completed_at, agent=SCREENER):
+    """A run as `multica issue runs` reports a provider refusal."""
+
+    run = _squad_run(run_id, agent, status="failed", completed_at=completed_at)
+    run.update(
+        created_at=created_at,
+        started_at=created_at,
+        error=QUOTA_ERROR,
+        failure_reason="agent_error.provider_quota_limit",
+    )
+    return run
+
+
+ASSIGNED = _failed_run("A", "2026-11-04T06:14:10Z", "2026-11-04T06:14:17Z")
+COMMENTED = _failed_run("B", "2026-11-04T06:14:12Z", "2026-11-04T06:14:21Z")
+REFUSED_TRIGGER = _squad_comment(MEMBER, "2026-11-04T06:14:12Z", "트리거\n<!-- ACTION: XXX -->")
+
+
+def test_the_squad_wait_gives_up_once_every_run_failed():
+    stub = _SquadStub([([ASSIGNED, COMMENTED], [REFUSED_TRIGGER])] * 2)
+
+    resp = _wait(stub, timeout=60.0, since=REFUSED_SINCE)
+
+    assert resp is not None
+    assert resp.action == md.RUN_FAILED
+    assert resp.failure_reason == md.QUOTA_FAILURE_REASON
+    assert resp.output == QUOTA_ERROR
+    assert resp.run_id == "B"
+
+
+def test_one_failed_run_does_not_end_the_wait_while_another_works():
+    working = _squad_run("B", SCREENER, status="running")
+    working["created_at"] = "2026-11-04T06:14:12Z"
+    done = _squad_run("B", SCREENER, completed_at="2026-11-04T06:15:02Z", output="REJECT 게시")
+    done["created_at"] = "2026-11-04T06:14:12Z"
+    verdict = _squad_comment(SCREENER, "2026-11-04T06:15:00Z", "<!-- ACTION: REJECT -->", "B")
+    stub = _SquadStub(
+        [
+            ([ASSIGNED, working], [REFUSED_TRIGGER]),
+            ([ASSIGNED, working], [REFUSED_TRIGGER]),
+            ([ASSIGNED, done], [REFUSED_TRIGGER, verdict]),
+        ]
+    )
+
+    resp = _wait(stub, timeout=60.0, since=REFUSED_SINCE)
+
+    assert resp is not None and resp.action == "REJECT"
+
+
+def test_a_failure_from_before_the_trigger_is_not_this_dispatchs():
+    earlier = _failed_run("Z", "2026-11-04T06:09:10Z", "2026-11-04T06:09:14Z")
+    stub = _SquadStub([([earlier], [])])
+
+    assert _wait(stub, timeout=0.05, since=REFUSED_SINCE) is None
+
+
+class _RunsStub(_StubDispatcher):
+    """`wait_for_new_action` stub that also answers `list_runs`."""
+
+    def __init__(self, runs):
+        super().__init__(runs_seq=[], comments_seq=[])
+        self._runs = runs
+
+    async def list_runs(self, issue_id):  # type: ignore[override]
+        return list(self._runs)
+
+
+def test_the_action_wait_gives_up_on_failed_runs_when_told_when_it_asked():
+    """KB금융 holding_swing, 11/04 — same refusal on an evaluator issue."""
+
+    runs = [
+        _failed_run("A", "2026-11-04T05:07:45Z", "2026-11-04T05:07:51Z", agent=EVALUATOR),
+        _failed_run("B", "2026-11-04T05:07:47Z", "2026-11-04T05:07:54Z", agent=EVALUATOR),
+    ]
+    since = datetime(2026, 11, 4, 5, 7, 12, tzinfo=timezone.utc)
+
+    resp = asyncio.run(
+        _RunsStub(runs).wait_for_new_action(
+            "issue-1", prev_run_id=None, timeout_seconds=60, poll_seconds=0.01, since=since
+        )
+    )
+    assert resp is not None and resp.action == md.RUN_FAILED and resp.run_id == "B"
+
+    # Without `since` the wait cannot tell its runs from older ones, and
+    # keeps the old contract: nothing finished, so None at the deadline.
+    resp = asyncio.run(
+        _RunsStub(runs).wait_for_new_action(
+            "issue-1", prev_run_id=None, timeout_seconds=0.05, poll_seconds=0.01
+        )
+    )
+    assert resp is None

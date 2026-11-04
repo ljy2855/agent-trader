@@ -15,7 +15,8 @@ The watcher posts trigger comments and waits asynchronously for the
 agent's next *new* completed run, parsing the ``<!-- ACTION: ... -->``
 tag from the run output. On a candidate issue it waits instead for the
 squad leader's own verdict once the thread has gone quiet
-(``wait_for_squad_verdict``).
+(``wait_for_squad_verdict``). Either wait gives up early with ``RUN_FAILED``
+when every run the trigger started has failed.
 """
 
 from __future__ import annotations
@@ -145,7 +146,20 @@ class ActionResponse:
     output: str
     run_id: str | None
     completed_at: datetime | None
+    # Multica's code for why the run failed; set only on RUN_FAILED.
+    failure_reason: str | None = None
 
+
+# Not an agent ACTION: every run the dispatch started failed, and `output`
+# carries the run's error.
+RUN_FAILED = "RUN_FAILED"
+# Multica's `failure_reason` when the provider refused the run for quota. The
+# subscription is shared by every agent on the runtime, so all of them fail
+# the same way until it resets.
+QUOTA_FAILURE_REASON = "agent_error.provider_quota_limit"
+# Polls a failed dispatch must stay failed before the wait gives up on it, so
+# a run Multica is about to queue behind the failure still gets its chance.
+FAILED_RUN_CONFIRM_POLLS = 2
 
 # Run states that can still post to the thread. Anything else — completed,
 # failed, cancelled, or a state this list does not know — reads as finished,
@@ -164,6 +178,35 @@ def _parse_time(raw: Any) -> datetime | None:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def failed_dispatch(runs: list[dict[str, Any]], since: datetime) -> dict[str, Any] | None:
+    """The newest failed run, when every run created since ``since`` failed.
+
+    A run the provider refuses fails within seconds and nothing else on the
+    thread moves, so a wait that only looks for answers sits out its whole
+    timeout. On 2026-11-04 the agents' codex quota ran out at 09:00 and each
+    of 53 dispatches waited 300 seconds for a reply that could not come.
+    Cancelled or unfamiliar states do not count as failed.
+    """
+
+    recent = [
+        r for r in runs
+        if (at := _parse_time(r.get("created_at"))) is not None and at >= since
+    ]
+    if not recent or any(r.get("status") != "failed" for r in recent):
+        return None
+    return max(recent, key=lambda r: str(r.get("completed_at") or ""))
+
+
+def _failure_response(run: dict[str, Any]) -> ActionResponse:
+    return ActionResponse(
+        action=RUN_FAILED,
+        output=str(run.get("error") or ""),
+        run_id=str(run.get("id") or "") or None,
+        completed_at=_parse_time(run.get("completed_at")),
+        failure_reason=str(run.get("failure_reason") or "") or None,
+    )
 
 
 @dataclass(slots=True, frozen=True)
@@ -194,6 +237,8 @@ class SquadThread:
     # The newest leader run that finished, tag or not: the NO_TAG answer
     # when the leader never posts one.
     last_leader_run: dict[str, Any] | None = None
+    # Set when every run since the trigger failed — see `failed_dispatch`.
+    failed_run: dict[str, Any] | None = None
 
     @property
     def leader_verdicts(self) -> list[Verdict]:
@@ -632,6 +677,7 @@ class MulticaDispatcher:
         prev_run_id: str | None,
         timeout_seconds: int,
         poll_seconds: int = 10,
+        since: datetime | None = None,
     ) -> ActionResponse | None:
         """Poll runs/comments until a VALID_ACTION appears or timeout.
 
@@ -649,6 +695,8 @@ class MulticaDispatcher:
             - ActionResponse with action in VALID_ACTIONS if found.
             - ActionResponse with action="NO_TAG" if at least one new run
               completed but no VALID_ACTION appeared before the deadline.
+            - ActionResponse with action=RUN_FAILED once every run created
+              since ``since`` has failed (only when ``since`` is given).
             - None if no new run completed before the deadline.
         """
 
@@ -658,6 +706,8 @@ class MulticaDispatcher:
         last_run_id = prev_run_id
         no_tag_response: ActionResponse | None = None
         no_tag_since: str | None = None
+        failed: dict[str, Any] | None = None
+        failed_polls = 0
 
         while True:
             await asyncio.sleep(poll_seconds)
@@ -704,8 +754,16 @@ class MulticaDispatcher:
                         run_id=no_tag_response.run_id,
                         completed_at=no_tag_response.completed_at,
                     )
+            elif since is not None:
+                runs = await self.list_runs(issue_id)
+                failed = failed_dispatch(runs, since) if runs is not None else None
+                failed_polls = failed_polls + 1 if failed is not None else 0
+                if failed is not None and failed_polls >= FAILED_RUN_CONFIRM_POLLS:
+                    return _failure_response(failed)
 
             if loop.time() >= deadline:
+                if no_tag_response is None and failed is not None:
+                    return _failure_response(failed)
                 return no_tag_response
 
     async def read_squad_thread(
@@ -795,6 +853,7 @@ class MulticaDispatcher:
             verdicts=verdicts,
             active_runs=sum(1 for r in runs if r.get("status") in ACTIVE_RUN_STATUSES),
             last_leader_run=last_leader_run,
+            failed_run=failed_dispatch(runs, since),
         )
 
     async def wait_for_squad_verdict(
@@ -821,12 +880,14 @@ class MulticaDispatcher:
         Returns:
             - the leader's newest verdict, settled or at the deadline;
             - action="NO_TAG" if a leader run finished without one;
+            - action=RUN_FAILED as soon as every run since ``since`` failed;
             - None if no leader run finished before the deadline.
         """
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max(timeout_seconds, 1)
         last: SquadThread | None = None
+        failed_polls = 0
         while True:
             await asyncio.sleep(poll_seconds)
             thread = await self.read_squad_thread(issue_id, since=since)
@@ -835,6 +896,9 @@ class MulticaDispatcher:
                 final = thread.final_leader()
                 if final is not None and thread.active_runs == 0:
                     return _verdict_response(final)
+                failed_polls = failed_polls + 1 if thread.failed_run is not None else 0
+                if failed_polls >= FAILED_RUN_CONFIRM_POLLS:
+                    return _failure_response(thread.failed_run)
             if loop.time() >= deadline:
                 break
 
@@ -843,6 +907,8 @@ class MulticaDispatcher:
         final = last.final_leader()
         if final is not None:
             return _verdict_response(final)
+        if last.failed_run is not None:
+            return _failure_response(last.failed_run)
         run = last.last_leader_run
         if run is None:
             return None
@@ -1007,9 +1073,12 @@ __all__ = [
     "ActionResponse",
     "IssueRef",
     "MulticaDispatcher",
+    "QUOTA_FAILURE_REASON",
+    "RUN_FAILED",
     "SquadThread",
     "VALID_ACTIONS",
     "Verdict",
     "extract_action_tag",
     "extract_parent_id",
+    "failed_dispatch",
 ]

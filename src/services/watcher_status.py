@@ -133,6 +133,8 @@ class WatcherStatusRegistry:
         self._candidates: dict[str, Any] | None = None
         # Approvals waiting for the closing auction (entry_execution=close_auction).
         self._close_auction_entries: list[dict[str, Any]] = []
+        # Tier-2 dispatch paused on a spent agent quota, or None.
+        self._agent_pause: dict[str, Any] | None = None
         # What the previous process last persisted, loaded once at startup.
         # Everything above is in-memory and empty until the first tick, which
         # outside market hours never comes: after a holiday-morning rollout the
@@ -363,6 +365,12 @@ class WatcherStatusRegistry:
         with self._lock:
             self._close_auction_entries = [dict(entry) for entry in entries]
 
+    def set_agent_pause(self, payload: dict[str, Any] | None) -> None:
+        """Publish the agent-dispatch pause (``AgentPause.to_dict``), or None."""
+
+        with self._lock:
+            self._agent_pause = dict(payload) if payload else None
+
     def set_last_session(self, payload: dict[str, Any] | None) -> None:
         """Publish the previous process's persisted snapshot, as read."""
 
@@ -406,6 +414,9 @@ class WatcherStatusRegistry:
                 "close_auction_entries": [
                     dict(entry) for entry in self._close_auction_entries
                 ],
+                "agent_pause": (
+                    dict(self._agent_pause) if self._agent_pause else None
+                ),
                 "last_session": (
                     dict(self._last_session) if self._last_session else None
                 ),

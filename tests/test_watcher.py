@@ -132,7 +132,7 @@ class StubDispatcher:
         return None
 
     async def wait_for_new_action(
-        self, issue_id, *, prev_run_id, timeout_seconds, poll_seconds=10
+        self, issue_id, *, prev_run_id, timeout_seconds, poll_seconds=10, since=None
     ):
         if self._action is None:
             return None
@@ -1462,7 +1462,7 @@ def test_filter_disabled_when_verbose_flag_set():
 class BoomDispatcher(StubDispatcher):
     """Dispatcher whose agent-response poll always explodes."""
 
-    async def wait_for_new_action(self, issue_id, *, prev_run_id, timeout_seconds, poll_seconds=10):
+    async def wait_for_new_action(self, issue_id, *, prev_run_id, timeout_seconds, poll_seconds=10, since=None):
         raise RuntimeError("multica CLI exited 1")
 
 
@@ -1589,7 +1589,7 @@ def test_cancellation_is_recorded_separately_from_failure():
     """Shutdown cancels in-flight tasks; that is not a fault."""
 
     class HangingDispatcher(StubDispatcher):
-        async def wait_for_new_action(self, issue_id, *, prev_run_id, timeout_seconds, poll_seconds=10):
+        async def wait_for_new_action(self, issue_id, *, prev_run_id, timeout_seconds, poll_seconds=10, since=None):
             await asyncio.sleep(3600)
 
     w = _build_watcher(dispatcher=HangingDispatcher())
@@ -1620,7 +1620,7 @@ def test_cancel_in_flight_retrieves_exceptions_and_clears_slots():
     """Shutdown must not leave an unretrieved task exception behind."""
 
     class HangingDispatcher(StubDispatcher):
-        async def wait_for_new_action(self, issue_id, *, prev_run_id, timeout_seconds, poll_seconds=10):
+        async def wait_for_new_action(self, issue_id, *, prev_run_id, timeout_seconds, poll_seconds=10, since=None):
             await asyncio.sleep(3600)
 
     dispatcher = HangingDispatcher()
@@ -4680,6 +4680,189 @@ def test_a_crash_at_the_open_waits_for_the_busy_pm(monkeypatch):
 
     asyncio.run(driver())
     assert len(pages()) == 1
+
+
+# -- agent quota pause ------------------------------------------------------
+#
+# 2026-11-04: the agents' codex quota ran out at 09:00 and every run failed
+# within seconds until 15:40. Each dispatch waited out its 300s timeout,
+# re-fired on the cooldown, and Discord heard 53 "agent 응답 없음" without
+# the cause.
+
+QUOTA_ERROR = (
+    "You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), "
+    "visit https://chatgpt.com/settings/usage to purchase more credits or try again at 3:40 PM."
+)
+
+
+def _quota_failure(**extra):
+    return ActionResponse(
+        action=watcher_module.RUN_FAILED,
+        output=QUOTA_ERROR,
+        run_id="run-failed",
+        completed_at=None,
+        failure_reason=watcher_module.QUOTA_FAILURE_REASON,
+        **extra,
+    )
+
+
+class _RefusedDispatcher(StubDispatcher):
+    """Every run the trigger starts fails the way Multica reports it."""
+
+    def __init__(self, response=None):
+        super().__init__()
+        self.response = response or _quota_failure()
+        self.waits = 0
+
+    async def wait_for_new_action(self, issue_id, **kwargs):
+        self.waits += 1
+        return self.response
+
+
+@pytest.mark.parametrize(
+    ("now", "expected"),
+    [
+        # 09:00:42, the first refusal: the reset is this afternoon.
+        (datetime(2026, 11, 4, 9, 0, 42, tzinfo=KST), datetime(2026, 11, 4, 15, 40, tzinfo=KST)),
+        # 15:40:07, the wrap: the reset was 15:40:22 — moments away, not tomorrow.
+        (datetime(2026, 11, 4, 15, 40, 7, tzinfo=KST), datetime(2026, 11, 4, 15, 41, 7, tzinfo=KST)),
+        # Well past it: tomorrow's 3:40 PM.
+        (datetime(2026, 11, 4, 16, 0, tzinfo=KST), datetime(2026, 11, 5, 15, 40, tzinfo=KST)),
+    ],
+)
+def test_the_quota_reset_is_read_from_the_refusal(now, expected):
+    assert watcher_module.quota_retry_at(QUOTA_ERROR, now) == expected
+
+
+def test_a_refusal_without_a_reset_time_probes_again_soon():
+    now = datetime(2026, 11, 4, 9, 0, tzinfo=KST)
+
+    assert watcher_module.quota_retry_at("usage limit reached", now) == now + timedelta(minutes=30)
+    assert watcher_module.quota_retry_at("try again at 13:61 PM", now) == now + timedelta(minutes=30)
+    assert watcher_module.quota_retry_at("try again at 12:05 AM", now) == datetime(
+        2026, 11, 5, 0, 5, tzinfo=KST
+    )
+
+
+def test_a_spent_quota_pauses_agent_dispatch_and_pages_once():
+    """KB금융 holding_swing, 11/04: 32 dispatches, each a failed run and a page."""
+
+    dispatcher = _RefusedDispatcher()
+    w = _build_watcher(dispatcher=dispatcher, config=_config(cooldown_seconds=0))
+
+    async def driver():
+        for _ in range(3):
+            await w._handle_trigger(_holding_event(), planner_result={})
+            for slot in list(w._in_flight.values()):
+                await slot.task
+
+    asyncio.run(driver())
+
+    assert dispatcher.waits == 1, "asked once, then held back"
+    triggers = [c for _, c in dispatcher.comments if "[트리거:" in c]
+    assert len(triggers) == 1
+    assert not [c for _, c in dispatcher.comments if "[watcher]" in c], (
+        "a comment would wake the refused agent into another failed run"
+    )
+    pages = [c for c in w._notifier.calls if c[0] == "error"]
+    assert len(pages) == 1
+    assert "사용 한도" in pages[0][1] and "Tier 1" in pages[0][2] and "3:40 PM" in pages[0][2]
+    assert not [c for c in w._notifier.calls if "timeout" in c[1]]
+    outcomes = [e["outcome"] for e in w._status.recent()]
+    assert outcomes.count("failed") == 1 and outcomes.count("skipped") == 2
+    state = w._status.snapshot()
+    assert state["agent_pause"]["skipped"] == 2
+    assert state["failures"]["multica"]["count"] == 1
+    assert w._agents_paused() is not None
+
+
+def test_tier1_is_not_paused_with_the_agents(monkeypatch):
+    sells: list[dict] = []
+
+    async def fake_sell(client, **kwargs):
+        sells.append(kwargs)
+        return {"success": True}
+
+    monkeypatch.setattr(watcher_module.order_service, "place_stock_sell_order", fake_sell)
+    w = _build_watcher(dispatcher=_RefusedDispatcher())
+    w._agent_pause = watcher_module.AgentPause(
+        until=datetime.now(KST) + timedelta(hours=6), since=datetime.now(KST), error=QUOTA_ERROR
+    )
+
+    asyncio.run(w._handle_trigger(_tier1_sell_event(), planner_result={}))
+
+    assert len(sells) == 1
+
+
+def test_another_failure_pages_without_pausing():
+    """A one-off refusal (10/23 "model at capacity") must not stop the day."""
+
+    response = _quota_failure()
+    response.failure_reason = "agent_error.unknown"
+    response.output = "Selected model is at capacity. Please try a different model."
+    w = _build_watcher(dispatcher=_RefusedDispatcher(response))
+
+    async def driver():
+        await w._handle_trigger(_holding_event(), planner_result={})
+        for slot in list(w._in_flight.values()):
+            await slot.task
+
+    asyncio.run(driver())
+
+    assert w._agent_pause is None
+    pages = [c for c in w._notifier.calls if c[0] == "error"]
+    assert len(pages) == 1 and "at capacity" in pages[0][2]
+
+
+def test_the_crash_page_waits_out_the_pause(monkeypatch):
+    """Spent on a pause, the once-a-day crash page would never reach the PM."""
+
+    dispatcher = StubDispatcher(action="ACKNOWLEDGE")
+    w = _build_watcher(dispatcher=dispatcher)
+    w._agent_pause = watcher_module.AgentPause(
+        until=datetime.now(KST) + timedelta(hours=6), since=datetime.now(KST), error=QUOTA_ERROR
+    )
+    at = datetime(2026, 11, 4, 9, 44, tzinfo=KST)
+    crash = _crash_regime(extreme=True, sticky=True)
+
+    async def tick(now):
+        monkeypatch.setattr(watcher_module, "plan_intraday_momentum_strategy", _regime_plan(crash))
+        await w._tick(now=now)
+        for slot in list(w._in_flight.values()):
+            await slot.task
+
+    def pages():
+        return [c for _, c in dispatcher.comments if "[트리거: extreme_risk_off]" in c]
+
+    async def driver():
+        await tick(at)
+        await tick(at + timedelta(seconds=30))
+        assert pages() == []
+        w._agent_pause.until = datetime.now(KST)  # the quota resets
+        await tick(at + timedelta(seconds=60))
+        await tick(at + timedelta(seconds=90))
+
+    asyncio.run(driver())
+    assert len(pages()) == 1
+
+
+def test_an_answer_after_the_pause_lifts_it():
+    w = _build_watcher()
+    since = datetime(2026, 11, 4, 9, 0, 42, tzinfo=KST)
+    w._agent_pause = watcher_module.AgentPause(
+        until=datetime(2026, 11, 4, 15, 40, tzinfo=KST), since=since, error=QUOTA_ERROR, skipped=7
+    )
+    stale = ActionResponse("HOLD", "", "run-0", since - timedelta(seconds=5))
+    fresh = ActionResponse("HOLD", "", "run-1", since + timedelta(hours=7))
+
+    asyncio.run(w._agents_answered(stale))
+    assert w._agent_pause is not None, "that run answered before the quota ran out"
+
+    asyncio.run(w._agents_answered(fresh))
+    assert w._agent_pause is None
+    assert w._status.snapshot()["agent_pause"] is None
+    assert [c[:2] for c in w._notifier.calls] == [("success", "agent 질의 재개")]
+    assert "7건" in w._notifier.calls[0][2]
 
 
 def _candidate_row(code, *, score, eligible, name=None):

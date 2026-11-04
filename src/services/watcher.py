@@ -69,6 +69,8 @@ from .krx_calendar import (
 )
 from .krx_ticks import floor_to_stock_tick
 from .multica_dispatch import (
+    QUOTA_FAILURE_REASON,
+    RUN_FAILED,
     ActionResponse,
     MulticaDispatcher,
     SquadThread,
@@ -173,6 +175,34 @@ AUCTION_PHASE_CLOSED = "closed"  # too late to submit, or no regular session
 # the same issue is at least a cooldown (300s) older.
 VERDICT_CLOCK_SLACK = timedelta(seconds=30)
 BUY_ACTIONS = frozenset({"TIER1", "TIER2"})
+
+# After the agents' provider refuses a run for quota, Tier-2 dispatch waits
+# for the reset its message names — or this long when it names none — and
+# trusts a named reset at most this far out. Tier 1 never waits.
+AGENT_QUOTA_RETRY_FALLBACK = timedelta(minutes=30)
+AGENT_QUOTA_RETRY_MAX = timedelta(hours=24)
+# The message gives the reset to the minute; one a little in the past is
+# about to happen, not tomorrow's.
+AGENT_QUOTA_RETRY_GRACE = timedelta(minutes=10)
+_QUOTA_RETRY_AT = re.compile(r"try again at (\d{1,2}):(\d{2})\s*([AP]M)\b", re.IGNORECASE)
+
+
+def quota_retry_at(error: str, now: datetime) -> datetime:
+    """When to ask the agents again after a quota refusal.
+
+    Codex names the reset as a wall-clock time on the agent host, which runs
+    on KST: "... or try again at 3:40 PM." A time well past means tomorrow's.
+    """
+
+    now = now.astimezone(KST)
+    match = _QUOTA_RETRY_AT.search(error or "")
+    if match is None or not 1 <= int(match[1]) <= 12 or int(match[2]) > 59:
+        return now + AGENT_QUOTA_RETRY_FALLBACK
+    hour = int(match[1]) % 12 + (12 if match[3].upper() == "PM" else 0)
+    at = now.replace(hour=hour, minute=int(match[2]), second=0, microsecond=0)
+    if at + AGENT_QUOTA_RETRY_GRACE < now:
+        at += timedelta(days=1)
+    return min(max(at, now + timedelta(minutes=1)), now + AGENT_QUOTA_RETRY_MAX)
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +447,32 @@ class InFlightTask:
 
 
 @dataclass(slots=True)
+class AgentPause:
+    """Tier-2 dispatch held back after the agents' quota ran out.
+
+    On 2026-11-04 the codex quota was spent at 09:00 and every run failed in
+    seconds until 15:40. The watcher kept dispatching: 53 triggers each waited
+    out the 300s timeout, re-fired on the cooldown and opened 123 failed runs,
+    and Discord heard "agent 응답 없음" without the cause until the 16:00
+    digest. While paused nothing is asked; the pause lifts at ``until`` and
+    stays on record until an agent answers again.
+    """
+
+    until: datetime
+    since: datetime
+    error: str
+    skipped: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "until": self.until.isoformat(),
+            "since": self.since.isoformat(),
+            "error": self.error,
+            "skipped": self.skipped,
+        }
+
+
+@dataclass(slots=True)
 class CloseAuctionEntry:
     """An approved candidate waiting for the closing auction.
 
@@ -595,6 +651,8 @@ class IntradayWatcher:
         # inside the band must not silence the next morning's crash. A page
         # held back by a busy PM leaves it unset, so the next tick sends it.
         self._extreme_risk_off_day: str | None = None
+        # Set while the agents' quota is spent — see `AgentPause`.
+        self._agent_pause: AgentPause | None = None
         # Last regime label that we already announced as a flip — used as
         # the baseline for the next debounced flip detection.
         self._last_emitted_regime: str | None = None
@@ -1850,6 +1908,11 @@ class IntradayWatcher:
                 # in a crash from 09:00:41 to the close and nobody was paged.
                 self._extreme_risk_off_day = None
             return  # already processing this scope
+        if event.trigger_type == "extreme_risk_off" and self._agents_paused() is not None:
+            # As with a busy PM: unlatch, so the page goes out on the first
+            # tick after the pause instead of being spent on it.
+            self._extreme_risk_off_day = None
+            return
         if self._should_skip_holding_swing(event):
             return  # repeat no-op on an idling holding — don't burn an agent call
         if self._should_skip_new_candidate(event):
@@ -2372,6 +2435,17 @@ class IntradayWatcher:
     ) -> None:
         """Post the trigger comment and spawn a polling task."""
 
+        pause = self._agents_paused()
+        if pause is not None:
+            pause.skipped += 1
+            self._status.set_agent_pause(pause.to_dict())
+            self._status.mark_outcome(
+                entry,
+                outcome="skipped",
+                detail=f"agent 사용 한도 소진 — {pause.until:%m/%d %H:%M}까지 질의 중단",
+            )
+            return
+
         issue = await self._ensure_issue_for(event)
         if issue is None:
             log.warning("tier2 dispatch skipped — no issue: %s", event.cooldown_key())
@@ -2670,7 +2744,13 @@ class IntradayWatcher:
                     prev_run_id=prev_run_id,
                     timeout_seconds=self._config.agent_timeout_seconds,
                     poll_seconds=self._config.agent_poll_seconds,
+                    since=self._verdict_since(event),
                 )
+            if response is not None and response.action == RUN_FAILED:
+                await self._on_agent_run_failed(event, entry, response)
+                return
+            if response is not None:
+                await self._agents_answered(response)
             if response is None:
                 log.warning(
                     "tier2 timeout: %s (no agent response within %ss)",
@@ -3862,6 +3942,68 @@ class IntradayWatcher:
 
     def _verdict_since(self, event: TriggerEvent) -> datetime:
         return event.detected_at.astimezone(timezone.utc) - VERDICT_CLOCK_SLACK
+
+    # -- agent quota pause ---------------------------------------------------
+
+    def _agents_paused(self) -> AgentPause | None:
+        pause = self._agent_pause
+        if pause is None or datetime.now(KST) >= pause.until:
+            return None
+        return pause
+
+    async def _on_agent_run_failed(
+        self, event: TriggerEvent, entry: TriggerLogEntry, response: ActionResponse
+    ) -> None:
+        """Record a dispatch whose every run failed; pause on a spent quota.
+
+        No "[watcher]" comment goes on the issue: a comment wakes the agent,
+        and a refused agent fails again.
+        """
+
+        error = sanitize_error_detail(response.output or "agent run failed")
+        detail = self._record_failure(
+            FAILURE_MULTICA, f"{response.failure_reason or 'run failed'}: {error}"
+        )
+        log.warning("tier2 agent run failed: %s — %s", event.cooldown_key(), detail)
+        self._status.mark_outcome(entry, outcome="failed", detail=f"agent 실행 실패 — {detail}")
+        target = f"{event.stock_name or event.target_role} ({event.stock_code or '-'})"
+        if response.failure_reason != QUOTA_FAILURE_REASON:
+            await self._safe_notify_error(f"agent 실행 실패 · {event.trigger_type}", f"{target} — {detail}")
+            return
+        if self._agents_paused() is not None:
+            return  # another dispatch already paused and paged
+        now = datetime.now(KST)
+        earlier = self._agent_pause
+        self._agent_pause = AgentPause(
+            until=quota_retry_at(response.output, now),
+            since=earlier.since if earlier is not None else now,
+            error=error,
+        )
+        self._status.set_agent_pause(self._agent_pause.to_dict())
+        await self._safe_notify_error(
+            "agent 사용 한도 소진 — 질의 중단",
+            f"{self._agent_pause.until:%m/%d %H:%M}까지 agent에 묻지 않습니다. 그동안 신규 매수는 "
+            "스크리너 승인이 없어 일어나지 않고, PM·평가사 점검도 없습니다. Tier 1 손절·익절·"
+            f"미체결 취소는 계속합니다.\n처음 걸린 트리거: {event.trigger_type} {target}\n원문: {error}",
+        )
+
+    async def _agents_answered(self, response: ActionResponse) -> None:
+        """Lift the pause record once an agent run finishes after it began."""
+
+        pause = self._agent_pause
+        if pause is None:
+            return
+        # A dispatch sent before the quota ran out can still come back with
+        # the answer its run gave then.
+        if response.completed_at is None or response.completed_at <= pause.since:
+            return
+        self._agent_pause = None
+        self._status.set_agent_pause(None)
+        await self._notifier.success(
+            "agent 질의 재개",
+            f"{pause.since:%m/%d %H:%M}부터 멈췄던 agent가 다시 응답합니다. "
+            f"멈춘 동안 건너뛴 트리거 {pause.skipped}건.",
+        )
 
     async def _follow_screener_verdict(
         self,
