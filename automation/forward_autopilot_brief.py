@@ -85,6 +85,12 @@ MULTICA_BIN = os.environ.get("MULTICA_BIN", "multica")
 PROJECT = os.environ.get("MULTICA_PROJECT", "")
 DAILY_LABEL = os.environ.get("TRADING_MODE_LABEL", "")
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+# The watcher's per-day parent issue is titled `YYYY-MM-DD <suffix>`;
+# src/services/multica_dispatch.py reads the same variable and default.
+DAILY_TITLE_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2} "
+    + re.escape(os.environ.get("DAILY_ISSUE_SUFFIX", "장중 실거래"))
+)
 
 
 def _today_kst() -> str:
@@ -398,33 +404,57 @@ def _issue_has_valid_action(issue_id: str) -> bool:
     return False
 
 
+def _is_daily_container(issue: dict) -> bool:
+    """True for the watcher's per-day parent issue.
+
+    It only groups the day's issues. Since 2026-11-04 it has no assignee
+    (`ensure_daily_issue`), so no agent comments on it and it never carries
+    an ACTION tag. The wrap moves it to in_review; when the wrap fails it
+    stays in todo. Its children are judged on their own.
+    """
+
+    title = str(issue.get("title") or "")
+    return not issue.get("assignee_id") and DAILY_TITLE_RE.fullmatch(title) is not None
+
+
+def _list_by_status(status: str) -> list[dict] | None:
+    """The project's issues in one status, or None when the list fails."""
+
+    rc, out, err = _run(
+        [
+            "issue", "list", "--project", PROJECT,
+            "--status", status, "--limit", "200", "--output", "json",
+        ]
+    )
+    if rc != 0:
+        _err(f"close-resolved list failed ({status}): {err.strip()}")
+        return None
+    try:
+        return json.loads(out).get("issues", [])
+    except (json.JSONDecodeError, AttributeError):
+        return None
+
+
 def _close_resolved_issues() -> int:
     """Move resolved in_review issues from past trading days to done.
 
     Agents finish their run and post an ACTION comment but leave the issue
     in ``in_review``; without this they pile up indefinitely. We close only
     issues that are (a) created before today KST and (b) carry a terminal
-    ACTION tag — today's issues stay open since their cycle may still be
-    live. Idempotent: re-running closes nothing new.
+    ACTION tag or are a past day's container (`_is_daily_container`, in
+    in_review or todo). Today's issues stay open since their cycle may still
+    be live. Idempotent: re-running closes nothing new.
     """
 
     if not PROJECT:
         _err("close-resolved skipped: MULTICA_PROJECT unset")
         return 0
     today = _today_kst()
-    rc, out, err = _run(
-        [
-            "issue", "list", "--project", PROJECT,
-            "--status", "in_review", "--limit", "200", "--output", "json",
-        ]
-    )
-    if rc != 0:
-        _err(f"close-resolved list failed: {err.strip()}")
+    issues = _list_by_status("in_review")
+    if issues is None:
         return 0
-    try:
-        issues = json.loads(out).get("issues", [])
-    except (json.JSONDecodeError, AttributeError):
-        return 0
+    # Nothing else in todo is closed: there it is work nobody has done yet.
+    issues += [it for it in _list_by_status("todo") or [] if _is_daily_container(it)]
 
     closed = 0
     for it in issues:
@@ -437,7 +467,7 @@ def _close_resolved_issues() -> int:
             cdate = created[:10]
         if cdate >= today:
             continue  # today's issues may still be active
-        if not _issue_has_valid_action(it["id"]):
+        if not (_is_daily_container(it) or _issue_has_valid_action(it["id"])):
             continue  # unresolved — leave for manual review
         crc, _o, cerr = _run(["issue", "status", it["id"], "done"])
         if crc == 0:
