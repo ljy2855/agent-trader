@@ -167,8 +167,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--entry-mode",
         default="momentum",
-        choices=["momentum", "below_ma"],
-        help="진입 전략: momentum(급등 추격) | below_ma(이평 하회 눌림목 매수)",
+        choices=["momentum", "below_ma", "etf_allocation"],
+        help="momentum | below_ma | etf_allocation(한국·미국 지수 각47%%, max-positions=2, close_auction 필요)",
     )
     p.add_argument(
         "--ma-period",

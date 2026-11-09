@@ -67,7 +67,8 @@ from .krx_calendar import (
     next_regular_session_open,
     session_close_datetime,
 )
-from .krx_ticks import floor_to_stock_tick
+from .krx_ticks import floor_to_stock_tick, floor_to_etf_tick
+from . import etf_allocation
 from .multica_dispatch import (
     CONSEQUENTIAL_ACTIONS,
     QUOTA_FAILURE_REASON,
@@ -380,7 +381,7 @@ class WatcherConfig:
     leaders_market_tp: str = "000"  # "001" = KOSPI-only universe (large-cap strategy)
     day_change_min: float = 1.0  # candidate entry band lower bound (%) — momentum mode
     day_change_max: float = 29.5  # candidate entry band upper bound (%) — momentum mode
-    entry_mode: str = "momentum"  # "momentum" | "below_ma" (mean-reversion 눌림목)
+    entry_mode: str = "momentum"  # momentum | below_ma | etf_allocation
     ma_period: int = 20  # below_ma mode: MA length
     universe_mode: str = UNIVERSE_LEADERS  # leaders | roster | both
     # Append in-band candidate scores to /app/output for gate calibration.
@@ -585,6 +586,12 @@ class IntradayWatcher:
         candidate_journal: CandidateJournal | None = None,
         verdict_log_path: Path | None = None,
     ):
+        if config.entry_mode == etf_allocation.MODE and (
+            config.position_budget_pct != etf_allocation.TARGET_PCT
+            or config.max_positions != 2
+            or config.entry_execution != ENTRY_EXECUTION_CLOSE_AUCTION
+        ):
+            raise ValueError("etf_allocation requires budget 47%, max_positions=2, entry_execution=close_auction")
         self._settings = settings
         self._config = config
         self._dispatcher = dispatcher or MulticaDispatcher()
@@ -746,7 +753,16 @@ class IntradayWatcher:
             poll_interval_seconds=self._config.poll_interval_seconds,
             # Publish the effective config so observers read what this process is
             # actually running rather than reconstructing it from code defaults.
-            config=asdict(self._config),
+            config={
+                **asdict(self._config),
+                **({"allocation_policy": {
+                    "targets": etf_allocation.TARGETS,
+                    "target_pct_each": etf_allocation.TARGET_PCT,
+                    "rebalance_band_pct": etf_allocation.BAND_PCT,
+                    "rebalance_calendar_days": [1, 7],
+                    "etf_fixed_stop_take": False,
+                }} if self._config.entry_mode == etf_allocation.MODE else {}),
+            },
         )
         await self._notifier.info(
             "Watcher 시작",
@@ -900,7 +916,12 @@ class IntradayWatcher:
             await self._handle_protective_holdings(rows)
 
         try:
-            result = await plan_intraday_momentum_strategy(
+            planner = (
+                etf_allocation.plan_etf_allocation
+                if self._config.entry_mode == etf_allocation.MODE
+                else plan_intraday_momentum_strategy
+            )
+            result = await planner(
                 self._client,
                 self._settings,
                 watchlist=self._config.watchlist or None,
@@ -921,6 +942,7 @@ class IntradayWatcher:
                 ma_period=self._config.ma_period,
                 universe_mode=self._config.universe_mode,
                 holding_observer=observe_holdings,
+                **({"now": self._last_tick_at} if self._config.entry_mode == etf_allocation.MODE else {}),
             )
         except asyncio.CancelledError:
             raise
@@ -1119,7 +1141,7 @@ class IntradayWatcher:
         events: list[TriggerEvent] = []
         if not protective_holdings_observed:
             events += triggers.detect_tier1_holding_rules(
-                holdings,
+                self._hard_exit_holdings(holdings),
                 stop_loss_pct=self._config.stop_loss_pct,
                 hard_take_profit_pct=self._config.hard_take_profit_pct,
             )
@@ -1189,6 +1211,13 @@ class IntradayWatcher:
             interval_minutes=self._config.periodic_review_minutes,
         )
 
+        if self._config.entry_mode == etf_allocation.MODE:
+            # The allocation is deterministic. Existing hard exits/cancels and
+            # health events remain; an LLM cannot rotate or trim an index holding.
+            events = [e for e in events if e.tier == 1 or e.target_role == ROLE_RISK]
+            if auction_phase == AUCTION_PHASE_SUBMIT and result.get("success"):
+                events += self._allocation_events(result)
+
         for event in events:
             await self._handle_trigger(event, planner_result=result)
 
@@ -1235,12 +1264,35 @@ class IntradayWatcher:
 
     # -- state enrichment ----------------------------------------------------
 
+    def _hard_exit_holdings(self, holdings: list[dict]) -> list[dict]:
+        if self._config.entry_mode != etf_allocation.MODE:
+            return holdings
+        # Price-level stop/take rules belong to the legacy trading strategy.
+        # The long-term index allocation accepts market drawdowns; applying
+        # -4/+8 here would silently replace it with an untested trading rule.
+        return [h for h in holdings if order_ledger.normalize_stock_code(h.get("stock_code")) not in etf_allocation.TARGETS]
+
+    def _allocation_events(self, result: dict) -> list[TriggerEvent]:
+        allocation = result.get("allocation") or {}
+        events = []
+        for side in ("sells", "buys"):
+            for row in allocation.get(side, []):
+                events.append(TriggerEvent(
+                    trigger_type="etf_allocation_sell" if side == "sells" else "etf_allocation_buy",
+                    tier=1 if side == "sells" else 2, scope="stock", target_role=ROLE_SELF,
+                    stock_code=row["stock_code"], stock_name=row["stock_name"],
+                    snapshot={**row, "entry_price": str(int(row["current_price"])), "entry_order_type_code": "0"},
+                    detected_at=self._last_tick_at or datetime.now(KST), reason=row["reason"],
+                    suggested_action="sell_market" if side == "sells" else None,
+                ))
+        return events
+
     async def _handle_protective_holdings(self, holdings: list[dict[str, Any]]) -> None:
         """Apply hard exits before discretionary market scans can delay or fail."""
 
         enriched = self._enrich_holdings(holdings)
         events = triggers.detect_tier1_holding_rules(
-            enriched,
+            self._hard_exit_holdings(enriched),
             stop_loss_pct=self._config.stop_loss_pct,
             hard_take_profit_pct=self._config.hard_take_profit_pct,
         )
@@ -1460,6 +1512,7 @@ class IntradayWatcher:
         price: int | None,
         origin: str,
         decision_scope: str | None = None,
+        require_durable: bool = False,
     ) -> tuple[Any, str | None]:
         """Record an exit intent. Returns ``(intent, refusal_reason)``.
 
@@ -1477,7 +1530,7 @@ class IntradayWatcher:
             await self._alert_ledger_fault_once(
                 self._ledger_error or "order ledger unavailable"
             )
-            return None, None
+            return None, "routine allocation requires durable ledger" if require_durable else None
         try:
             registration = self._ledger.record_intent(
                 stock_code=stock_code,
@@ -1503,6 +1556,9 @@ class IntradayWatcher:
             return registration.intent, None
         except OrderLedgerError as exc:
             detail = self._record_failure(FAILURE_ORDER, exc)
+            if require_durable:
+                await self._alert_ledger_fault_once(detail)
+                return None, f"routine allocation ledger unavailable: {detail}"
             log.error(
                 "order ledger record failed for protective %s on %s — "
                 "proceeding with the order anyway: %s",
@@ -1967,8 +2023,37 @@ class IntradayWatcher:
 
         # Attribute by the path's dominant external dependency: Tier-1 talks to
         # the order API, Tier-2 dispatch talks to multica.
-        category = FAILURE_ORDER if event.tier == 1 else FAILURE_MULTICA
+        category = FAILURE_ORDER if event.tier == 1 or event.trigger_type == "etf_allocation_buy" else FAILURE_MULTICA
         try:
+            if event.trigger_type == "etf_allocation_buy":
+                if self._config.entry_mode != etf_allocation.MODE or not self._can_execute_orders():
+                    self._status.mark_outcome(entry, outcome="dry_run", detail="ETF allocation order disabled")
+                    return
+                if self._close_auction_phase() != AUCTION_PHASE_SUBMIT:
+                    self._status.mark_outcome(entry, outcome="skipped", detail="outside closing auction")
+                    return
+                async with self._buy_lock:
+                    result = await self._submit_candidate_buy(event, "TIER1", planner_result, close_auction=True)
+                self._status.mark_outcome(entry, outcome=result.state, detail=result.reason)
+                return
+            if event.trigger_type == "etf_allocation_sell":
+                # A routine trim is not a protective exit: stale account data
+                # or a broken ledger must not sell below the allocation target.
+                if self._config.entry_mode != etf_allocation.MODE or self._close_auction_phase() != AUCTION_PHASE_SUBMIT:
+                    self._status.mark_outcome(entry, outcome="skipped", detail="outside ETF allocation window")
+                    return
+                self._require_ledger()
+                fresh = await self._refresh_entry_portfolio(planner_result)
+                deltas = etf_allocation.allocation_orders(
+                    assets=float(fresh["portfolio"]["estimated_assets"]),
+                    holdings=fresh["holdings"], prices=fresh.get("allocation_prices") or {},
+                    now=self._market_session_status().observed_at,
+                )
+                wanted_sell = next((r for r in deltas["sells"] if r["stock_code"] == event.stock_code), None)
+                if wanted_sell is None:
+                    self._status.mark_outcome(entry, outcome="skipped", detail="ETF sell target already satisfied")
+                    return
+                event = replace(event, snapshot={**event.snapshot, "quantity": min(event.snapshot["quantity"], wanted_sell["quantity"])})
             if event.tier == 1:
                 await self._execute_tier1(event, entry)
                 return
@@ -2242,6 +2327,7 @@ class IntradayWatcher:
                 price=None,
                 origin=event.trigger_type,
                 decision_scope=event.trigger_type,
+                require_durable=event.trigger_type == "etf_allocation_sell",
             )
             if duplicate is not None:
                 return self._record_tier1_no_order(
@@ -2299,6 +2385,11 @@ class IntradayWatcher:
 
         result = OrderApplyResult.from_order_response(action, order_result)
         self._settle_intent(intent, result)
+        if event.trigger_type == "etf_allocation_sell" and result.order_no:
+            self._close_auction_orders.add((
+                self._market_session_status().observed_at.date().isoformat(),
+                order_ledger.normalize_order_no(result.order_no),
+            ))
         detail = " · ".join(
             part for part in (action, result.reason) if part
         )
@@ -3375,6 +3466,11 @@ class IntradayWatcher:
         fresh_budget = _safe_budget_amount(
             summary, position_budget_pct=self._config.position_budget_pct
         )
+        if self._config.entry_mode == etf_allocation.MODE:
+            # Per-position exposure is a NAV ceiling, not an available-cash
+            # ceiling. Cash/orderable funds are checked separately by the broker.
+            assets = etf_allocation.verified_assets(summary)
+            fresh_budget = floor(assets * etf_allocation.TARGET_PCT / 100)
         portfolio = {
             **old_portfolio,
             "position_budget": min(int(old_portfolio.get("position_budget") or 0), fresh_budget),
@@ -3383,7 +3479,7 @@ class IntradayWatcher:
                 self._config.max_positions,
             ),
             "holding_count": len(holdings),
-            "estimated_assets": summary.get("prsm_dpst_aset_amt") or summary.get("aset_evlt_amt"),
+            "estimated_assets": assets if self._config.entry_mode == etf_allocation.MODE else (summary.get("prsm_dpst_aset_amt") or summary.get("aset_evlt_amt")),
             "daily_pl_krw": summary.get("tdy_lspft"),
             "daily_pl_pct_broker": summary.get("tdy_lspft_rt"),
         }
@@ -3515,6 +3611,25 @@ class IntradayWatcher:
             if order_price < entry_int:
                 return OrderApplyResult.skipped(action, "동시호가 상한가가 기준가보다 낮음")
 
+        if self._config.entry_mode == etf_allocation.MODE:
+            if code not in etf_allocation.TARGETS or not close_auction:
+                return OrderApplyResult.skipped(action, "ETF 배분 허용 종목/체결 방식 불일치")
+            # Re-evaluate the target against the fresh account, so stale plans
+            # and a second tick cannot accumulate beyond the target.
+            prices = dict(planner_result.get("allocation_prices") or {})
+            prices[code] = entry_int
+            try:
+                refreshed = etf_allocation.allocation_orders(
+                    assets=float((planner_result.get("portfolio") or {}).get("estimated_assets") or 0),
+                    holdings=planner_result.get("holdings") or [], prices=prices,
+                    now=self._market_session_status().observed_at,
+                )
+            except (ValueError, TypeError):
+                return OrderApplyResult.skipped(action, "ETF 목표 배분 재검증 불가")
+            wanted = next((r for r in refreshed["buys"] if r["stock_code"] == code), None)
+            if wanted is None:
+                return OrderApplyResult.skipped(action, "ETF 목표 비중 도달/월초 조정 대상 아님")
+
         budget = (planner_result.get("portfolio") or {}).get("position_budget") or 0
         try:
             budget = int(budget)
@@ -3604,6 +3719,24 @@ class IntradayWatcher:
         usable = budget if action == "TIER1" else budget // 2
         usable = min(usable, remaining)
         quantity = floor(usable / entry_int)
+        if self._config.entry_mode == etf_allocation.MODE:
+            # Size at the maximum auction price, including commission.
+            quantity = min(quantity, floor(usable / (order_price * 1.00015)), wanted["quantity"])
+            from . import account as account_service
+            try:
+                orderable = await account_service.get_orderable_amount(
+                    self._client, stk_cd=code, trde_tp="2", uv=str(order_price),
+                )
+                rows = orderable.get("orderable_amount_data")
+                if not orderable.get("success") or orderable.get("warning") or not isinstance(rows, list) or len(rows) != 1:
+                    raise ValueError("주문가능현금 조회 불완전")
+                # 100% margin quantity explicitly excludes a leveraged purchase.
+                cash_qty = int(rows[0]["profa_100ord_alowq"])
+                if cash_qty < 0:
+                    raise ValueError("음수 주문가능수량")
+                quantity = min(quantity, cash_qty)
+            except (KeyError, TypeError, ValueError) as exc:
+                return OrderApplyResult.skipped(action, f"현금 주문가능수량 확인 불가: {exc}")
         if quantity < 1:
             return OrderApplyResult.skipped(
                 action, f"남은 예산 {usable:,}원으로 1주 미만"
@@ -3854,7 +3987,8 @@ class IntradayWatcher:
                 raise ValueError(
                     f"MA{self._config.ma_period} 진입 밴드 이탈 (현재가 {price:,})"
                 )
-        cap = floor_to_stock_tick(
+        tick_floor = floor_to_etf_tick if self._config.entry_mode == etf_allocation.MODE else floor_to_stock_tick
+        cap = tick_floor(
             price * (1 + self._config.stale_price_delta_pct / 100)
         )
         upper_limit = to_price(quote.get("upl_pric"))

@@ -2678,6 +2678,31 @@ DASHBOARD_HTML = r"""<!doctype html>
         agentStrategyRoot.innerHTML = `<div class="ag-empty">watcher가 실효 설정을 보고하지 않아 전략을 구성할 수 없습니다.<br>코드 기본값으로 추정하지 않습니다.</div>`;
         return;
       }
+      if (c.entry_mode === "etf_allocation") {
+        const p = c.allocation_policy;
+        if (!p) {
+          agentStrategyRoot.innerHTML = `<div class="ag-empty">ETF 배분 정책을 조회하는 중입니다.</div>`;
+          return;
+        }
+        const names = Object.entries(p.targets || {}).map(([code, name]) =>
+          `${escapeHtml(name)} (${escapeHtml(code)}) 각 ${escapeHtml(String(p.target_pct_each))}%`).join(" · ");
+        agentStrategyRoot.innerHTML = `<p class="ag-lead"><strong>한국·미국 지수 ETF 배분</strong><br>${names}</p>
+          <div class="ag-rules">
+            <div class="ag-rule"><div class="t">운용</div><ul>
+              <li>신규 편입과 비중 조정은 종가 동시호가 기준으로 계획합니다.</li>
+              <li>${c.execute_orders ? "실주문 설정이 켜져 있습니다. 실행 조건을 통과한 주문만 전송합니다." : "Dry-run 설정입니다. 배분 계획을 확인하며 주문은 전송하지 않습니다."}</li>
+              <li>매월 1~7일, 목표 비중에서 ${escapeHtml(String(p.rebalance_band_pct))}%p 이상 벗어나면 조정합니다.</li>
+              <li>정수 주수로 매수하며 남는 금액은 현금으로 보유합니다.</li>
+            </ul></div>
+            <div class="ag-rule"><div class="t">위험과 전환</div><ul>
+              <li>ETF에는 고정 손절·익절을 적용하지 않아 지수 하락에 따른 평가손실을 감수합니다.</li>
+              <li>기존 개별주식은 보호매도 규칙을 유지하며 동시호가 전환 청산을 계획합니다.</li>
+              <li>현금 주문가능수량·주문 원장·신규 매수 중지·시장 데이터 검사를 적용합니다.</li>
+              <li>월 수익률 목표는 보장되는 수익이 아닙니다.</li>
+            </ul></div>
+          </div>`;
+        return;
+      }
       const k = overview.strategy_constants || {};
       const n = (v) => `<span class="num">${escapeHtml(String(v))}</span>`;
       const market = { "001": "KOSPI", "101": "KOSDAQ", "000": "KOSPI·KOSDAQ" }[c.leaders_market_tp] || "";

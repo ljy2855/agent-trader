@@ -1,8 +1,7 @@
 """KRX stock tick sizes (호가가격단위), as revised on 2023-01-25.
 
 KOSPI and KOSDAQ share one table since that revision. ETFs and ETNs follow a
-different one (1원 under 2,000원, 5원 above) and are not covered here: the
-watcher never trades them.
+different one (1원 under 2,000원, 5원 above).
 
 Every band's lower bound is a multiple of that band's own tick, so flooring a
 price inside its band always lands on a valid price.
@@ -45,4 +44,13 @@ def floor_to_stock_tick(price: float) -> int:
     return whole - whole % stock_tick_size(whole)
 
 
-__all__ = ["floor_to_stock_tick", "stock_tick_size"]
+def floor_to_etf_tick(price: float) -> int:
+    """KRX ETF/ETN price units, distinct from the ordinary-stock table."""
+    if not isfinite(price) or price < 1:
+        raise ValueError(f"price must be at least 1 KRW: {price!r}")
+    whole = floor(price)
+    tick = 1 if whole < 2000 else 5
+    return whole - whole % tick
+
+
+__all__ = ["floor_to_stock_tick", "stock_tick_size", "floor_to_etf_tick"]

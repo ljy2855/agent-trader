@@ -151,6 +151,26 @@ uv run python main_watcher.py \
 
 로스터는 `src/constants/universe.py`의 KOSPI 대형주 목록 (수동 관리, 백테스트와 공용)
 
+### 지수 ETF 배분 모드
+
+`etf_allocation`은 KODEX 200(069500)과 TIGER 미국나스닥100(133690)을 각각 자산의
+47%까지 정수 주수로 편입한다. 남는 금액은 현금이다. 매월 1~7일에 목표 비중에서 10%p 이상
+벗어난 보유만 조정한다. 처음 편입하는 ETF와 기존 개별주식의 전환 청산은 날짜와 무관하게 계획한다.
+모든 배분 주문은 기존 watcher의 종가 동시호가·원장 경로를 사용한다. 매도 체결 후 슬롯이
+비워져야 새 종목을 사므로 전환에는 여러 거래일이 걸릴 수 있다.
+
+```bash
+uv run python main_watcher.py --entry-mode etf_allocation \
+  --entry-execution close_auction --position-budget-pct 47 \
+  --max-positions 2 --max-new-positions 2 --max-daily-new-entries 3
+```
+
+이 예시는 dry-run이다. 실주문은 기존 두 단계 live 스위치를 적용한다.
+ETF 매수는 증거금 100% 기준 주문가능수량을 추가 확인하며 조회 실패 시 보류한다.
+LLM의 승인·청산 판단, MA 눌림목 점수, 개별주식용 손절·익절은 ETF에 적용하지 않는다.
+ETF의 시장 하락 손실을 감수하는 장기 배분 방식이며 특정 월수익을 보장하지 않는다.
+기존 개별주식의 손절·익절과 주문취소는 전환 중에도 유지한다.
+
 ## 설정
 
 `.env`는 `src/config.py`의 `KIWOOM_*` 설정만 읽음. 나머지는 프로세스 환경 변수로 전달 (템플릿: `automation/trading_env.example.sh`)

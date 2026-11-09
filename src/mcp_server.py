@@ -108,7 +108,7 @@ OptionalPositionBudgetPercent = Annotated[
 # Strategy-shaping parameters, all optional: left unset they resolve from the
 # deployed watcher rather than from this file. See src/services/live_config.py.
 OptionalEntryMode = Annotated[
-    Literal["momentum", "below_ma"] | None,
+    Literal["momentum", "below_ma", "etf_allocation"] | None,
     Field(
         description=(
             "진입 시그널. momentum=당일 상승률 추격, below_ma=이동평균 하회 "

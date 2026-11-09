@@ -6824,6 +6824,155 @@ def test_intraday_high_starts_over_each_trading_day():
     assert "고점 이탈" in event.reason
 
 
+def _etf_watcher(**overrides):
+    return _auction_watcher(_at(15, 21), entry_mode="etf_allocation",
+                            position_budget_pct=47, max_positions=2, **overrides)
+
+
+def _etf_plan():
+    return {
+        "portfolio": {"position_budget": 564_000, "estimated_assets": 1_200_000, "max_positions": 2},
+        "holdings": [], "allocation_prices": {"069500": 100_000, "133690": 180_000},
+        "regime": {"market_data_complete": True, "extreme_risk_off": False},
+    }
+
+
+def test_etf_profile_refuses_incompatible_execution_configuration():
+    with pytest.raises(ValueError, match="etf_allocation requires"):
+        _build_watcher(config=_config(entry_mode="etf_allocation"))
+
+
+def test_etf_hard_exits_apply_to_legacy_positions_only():
+    w = _etf_watcher()
+    events = []
+
+    async def record(event, **kwargs):
+        events.append(event)
+
+    w._handle_trigger = record
+    asyncio.run(w._handle_protective_holdings([
+        {"stock_code": "A069500", "profit_rate": -10, "quantity": 5},
+        {"stock_code": "A133690", "profit_rate": 20, "quantity": 3},
+        {"stock_code": "A005930", "profit_rate": -5, "quantity": 1},
+    ]))
+    assert any(e.trigger_type == "stop_loss" and e.stock_code == "A005930" for e in events)
+    assert not any(e.trigger_type in {"stop_loss", "hard_take_profit"} and e.stock_code in {"A069500", "A133690"} for e in events)
+
+
+@pytest.mark.parametrize("execute", [False, True])
+def test_etf_buy_uses_order_gates_cash_quantity_and_ledger_without_llm(monkeypatch, execute):
+    from src.services import account
+    buys = _record_buys(monkeypatch)
+    w = _etf_watcher(execute_orders=execute)
+    _stub_still_valid(w, _auction_detail(100_000))
+
+    async def cash_only(*args, **kwargs):
+        assert kwargs["trde_tp"] == "2"
+        return {"success": True, "orderable_amount_data": [{"profa_100ord_alowq": "2"}]}
+
+    monkeypatch.setattr(account, "get_orderable_amount", cash_only)
+    event = replace(_auction_candidate("069500", price=100_000), trigger_type="etf_allocation_buy", target_role=ROLE_SELF)
+    asyncio.run(w._handle_trigger(event, planner_result=_etf_plan()))
+    assert w._dispatcher.comments == []
+    if execute:
+        assert len(buys) == 1
+        assert buys[0]["ord_qty"] == "2"
+        assert int(buys[0]["ord_uv"]) % 5 == 0
+        assert len(w._ledger.unresolved()) == 1
+        # Bypass the cooldown: the durable pending order still blocks a replay.
+        w._cooldowns.clear()
+        asyncio.run(w._handle_trigger(event, planner_result=_etf_plan()))
+        assert len(buys) == 1
+    else:
+        assert buys == []
+        assert w._ledger.unresolved() == []
+
+
+@pytest.mark.parametrize("cash_response", [
+    {"success": False},
+    {"success": True, "orderable_amount_data": [{}]},
+    {"success": True, "orderable_amount_data": [{"profa_100ord_alowq": "-1"}]},
+])
+def test_etf_cannot_buy_with_missing_or_bad_cash_allowance(monkeypatch, cash_response):
+    from src.services import account
+    buys = _record_buys(monkeypatch)
+    w = _etf_watcher()
+    _stub_still_valid(w, _auction_detail(100_000))
+
+    async def orderable(*args, **kwargs):
+        return cash_response
+
+    monkeypatch.setattr(account, "get_orderable_amount", orderable)
+    event = replace(_auction_candidate("069500", price=100_000), trigger_type="etf_allocation_buy", target_role=ROLE_SELF)
+    asyncio.run(w._handle_trigger(event, planner_result=_etf_plan()))
+    assert buys == []
+    assert w._ledger.unresolved() == []
+
+
+def test_etf_buy_cannot_bypass_new_entry_pause_or_auction_window(monkeypatch):
+    buys = _record_buys(monkeypatch)
+    w = _etf_watcher(new_entries_enabled=False)
+    event = replace(_auction_candidate("069500", price=100_000), trigger_type="etf_allocation_buy", target_role=ROLE_SELF)
+    asyncio.run(w._handle_trigger(event, planner_result=_etf_plan()))
+    w._config.new_entries_enabled = True
+    w._cooldowns.clear()
+    _move_clock(w, _at(10, 0))
+    asyncio.run(w._handle_trigger(event, planner_result=_etf_plan()))
+    assert buys == []
+
+
+def test_etf_routine_sell_fails_closed_if_ledger_breaks_during_record(monkeypatch):
+    sells = []
+
+    async def sell(*args, **kwargs):
+        sells.append(kwargs)
+
+    def broken(**kwargs):
+        raise OrderLedgerError("disk failure")
+
+    w = _etf_watcher()
+    monkeypatch.setattr(w._ledger, "record_intent", broken)
+    monkeypatch.setattr(watcher_module.order_service, "place_stock_sell_order", sell)
+    event = replace(_holding_swing_event("005930", 1), tier=1,
+                    trigger_type="etf_allocation_sell", suggested_action="sell_market")
+    result = asyncio.run(w._execute_tier1(event, _entry_for(event)))
+    assert result.state == "skipped"
+    assert sells == []
+
+
+@pytest.mark.parametrize("execute, fresh_quantity, expected_quantity", [
+    (False, 8, None),
+    (True, 5, None),
+    (True, 7, "2"),
+])
+def test_etf_trim_respects_dry_run_and_recomputes_target_from_fresh_holdings(
+    monkeypatch, execute, fresh_quantity, expected_quantity,
+):
+    sells = []
+
+    async def sell(*args, **kwargs):
+        sells.append(kwargs)
+        return {"success": True, "order_no": "1234"}
+
+    w = _etf_watcher(execute_orders=execute)
+    monkeypatch.setattr(watcher_module.order_service, "place_stock_sell_order", sell)
+    fresh = _etf_plan()
+    fresh["holdings"] = [{"stock_code": "069500", "quantity": fresh_quantity}]
+
+    async def refresh(_):
+        return fresh
+
+    w._refresh_entry_portfolio = refresh
+    event = replace(_auction_candidate("069500", price=100_000), tier=1,
+                    trigger_type="etf_allocation_sell", suggested_action="sell_market",
+                    target_role=ROLE_SELF, snapshot={"quantity": 3})
+    asyncio.run(w._handle_trigger(event, planner_result=_etf_plan()))
+    assert [r["ord_qty"] for r in sells] == ([] if expected_quantity is None else [expected_quantity])
+    assert w._dispatcher.comments == []
+    if expected_quantity is None:
+        assert w._ledger.unresolved() == []
+
+
 # -- the screener's verdict after the watcher acted on it ---------------------
 #
 # 2026-10-27, NAVER (SWO-1105): the screener posted a provisional TIER2 at

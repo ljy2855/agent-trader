@@ -1117,6 +1117,16 @@ async def plan_intraday_momentum_strategy(
     k8s/kiwoom-watcher.yaml) to mirror them exactly for inspection.
     """
 
+    if entry_mode == "etf_allocation":
+        if execute_orders:
+            raise ValueError("ETF allocation orders are only routed through the watcher")
+        from .etf_allocation import plan_etf_allocation
+        return await plan_etf_allocation(
+            client, settings, position_budget_pct=position_budget_pct,
+            max_positions=max_positions, holding_observer=holding_observer,
+            stock_detail_cache_ttl_seconds=stock_detail_cache_ttl_seconds,
+        )
+
     evaluation_result = await account.get_account_evaluation(client)
     evaluation_record, holdings = _normalize_holding_rows(evaluation_result)
     if holding_observer is not None and evaluation_result.get("success"):
