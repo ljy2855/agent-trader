@@ -3724,8 +3724,13 @@ class IntradayWatcher:
             quantity = min(quantity, floor(usable / (order_price * 1.00015)), wanted["quantity"])
             from . import account as account_service
             try:
+                # kt00010 fills the *quantity* fields only when the expected
+                # buy price is sent: with `uv` alone every `*_alowq` comes
+                # back "0000000000" while the amounts are real (2026-11-09,
+                # live account), which would skip every ETF buy as "<1주".
                 orderable = await account_service.get_orderable_amount(
                     self._client, stk_cd=code, trde_tp="2", uv=str(order_price),
+                    exp_buy_unp=str(order_price),
                 )
                 rows = orderable.get("orderable_amount_data")
                 if not orderable.get("success") or orderable.get("warning") or not isinstance(rows, list) or len(rows) != 1:
@@ -3734,6 +3739,11 @@ class IntradayWatcher:
                 cash_qty = int(rows[0]["profa_100ord_alowq"])
                 if cash_qty < 0:
                     raise ValueError("음수 주문가능수량")
+                cash_amt = int(rows[0]["profa_100ord_alow_amt"])
+                if cash_qty == 0 and cash_amt >= order_price * 1.00015:
+                    # The amount affords a share but the quantity says none:
+                    # the broker did not compute it. Say so rather than "<1주".
+                    raise ValueError(f"주문가능수량 0 vs 주문가능금액 {cash_amt:,}원 불일치")
                 quantity = min(quantity, cash_qty)
             except (KeyError, TypeError, ValueError) as exc:
                 return OrderApplyResult.skipped(action, f"현금 주문가능수량 확인 불가: {exc}")

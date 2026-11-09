@@ -6867,8 +6867,15 @@ def test_etf_buy_uses_order_gates_cash_quantity_and_ledger_without_llm(monkeypat
     _stub_still_valid(w, _auction_detail(100_000))
 
     async def cash_only(*args, **kwargs):
+        # Shaped like live kt00010 (2026-11-09): the quantity is computed only
+        # when `exp_buy_unp` is sent; without it the field is all zeros.
         assert kwargs["trde_tp"] == "2"
-        return {"success": True, "orderable_amount_data": [{"profa_100ord_alowq": "2"}]}
+        amount = 205_000
+        price = int(kwargs.get("exp_buy_unp") or 0)
+        qty = amount // price if price else 0
+        return {"success": True, "orderable_amount_data": [{
+            "profa_100ord_alow_amt": f"{amount:012d}", "profa_100ord_alowq": f"{qty:010d}",
+        }]}
 
     monkeypatch.setattr(account, "get_orderable_amount", cash_only)
     event = replace(_auction_candidate("069500", price=100_000), trigger_type="etf_allocation_buy", target_role=ROLE_SELF)
@@ -6891,7 +6898,9 @@ def test_etf_buy_uses_order_gates_cash_quantity_and_ledger_without_llm(monkeypat
 @pytest.mark.parametrize("cash_response", [
     {"success": False},
     {"success": True, "orderable_amount_data": [{}]},
-    {"success": True, "orderable_amount_data": [{"profa_100ord_alowq": "-1"}]},
+    {"success": True, "orderable_amount_data": [{"profa_100ord_alowq": "-1", "profa_100ord_alow_amt": "000000500000"}]},
+    # Live kt00010 without `exp_buy_unp` answers like this: an amount, and zero quantity.
+    {"success": True, "orderable_amount_data": [{"profa_100ord_alowq": "0000000000", "profa_100ord_alow_amt": "000000700000"}]},
 ])
 def test_etf_cannot_buy_with_missing_or_bad_cash_allowance(monkeypatch, cash_response):
     from src.services import account
