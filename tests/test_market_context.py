@@ -11,6 +11,7 @@ import asyncio
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -31,6 +32,48 @@ YAHOO_NQ = {"chart": {"result": [{"meta": {
                               "open": [26640.25, 26878.5, 28064.0, 27899.5]}],
                    "adjclose": [{"adjclose": [27085.25, 28014.5, 27835.25, 28360.75]}]}}],
     "error": None}}
+
+NEW_YORK = ZoneInfo("America/New_York")
+
+# NQ=F hourly closes cut from the same capture (range=5d, interval=60m), by
+# bar start in New York time. `None` is how Yahoo sends an hour without a
+# trade: the 17:00 maintenance hour and the weekend.
+NQ_HOURLY = [
+    ("11/06 14:00", 27205.5), ("11/06 15:00", 27076.5), ("11/06 16:00", 27085.25),
+    ("11/06 17:00", None), ("11/08 17:00", None), ("11/08 18:00", 26967.0),
+    ("11/09 14:00", 28025.5), ("11/09 15:00", 28004.75), ("11/09 16:00", 28073.25),
+    ("11/09 17:00", 28073.25), ("11/09 18:00", 28076.75), ("11/10 13:00", 27694.5),
+    ("11/10 14:00", 27748.75), ("11/10 15:00", 27835.25), ("11/10 16:00", 27900.75),
+    ("11/10 17:00", None), ("11/10 18:00", 27952.75), ("11/10 19:00", 28021.0),
+    ("11/10 23:00", 28195.75), ("11/11 00:00", 28244.5), ("11/11 07:00", 28356.75),
+    ("11/11 08:00", 28374.0), ("11/11 09:00", 28359.75),
+]
+
+
+def _new_york(label: str) -> int:
+    return int(datetime.strptime(f"2026/{label}", "%Y/%m/%d %H:%M").replace(tzinfo=NEW_YORK).timestamp())
+
+
+def _hourly(rows=NQ_HOURLY, *, seen: str, price: float) -> dict:
+    """The hourly answer as it stood at `seen` (New York), in Yahoo's shape.
+
+    Yahoo appends the live quote as a last point stamped with the quote
+    time; the capture ends `1794405600` (09:00) then `1794407450` (09:30:50).
+    """
+
+    at = _new_york(seen)
+    past = [(_new_york(label), close) for label, close in rows if _new_york(label) <= at]
+    return {"chart": {"result": [{"meta": {
+        "currency": "USD", "symbol": "NQ=F", "exchangeName": "CME", "instrumentType": "FUTURE",
+        "regularMarketTime": at, "gmtoffset": -18000, "timezone": "EST",
+        "exchangeTimezoneName": "America/New_York", "regularMarketPrice": price,
+        "chartPreviousClose": 27085.25, "dataGranularity": "1h", "range": "5d"},
+        "timestamp": [stamp for stamp, _ in past] + [at],
+        "indicators": {"quote": [{"close": [close for _, close in past] + [price]}]}}],
+        "error": None}}
+
+
+YAHOO_NQ_HOURLY = _hourly(seen="11/11 09:30", price=28370.0)
 
 YAHOO_069500 = {"chart": {"result": [{"meta": {
     "currency": "KRW", "symbol": "069500.KS", "exchangeName": "KSC", "instrumentType": "ETF",
@@ -95,6 +138,59 @@ def test_yahoo_change_comes_from_the_last_two_bars_not_chart_previous_close():
     assert mc._quote(chart, "x")["change_pct"] == 1.89
     assert chart["last_date"] == "2026-11-11"  # exchange-local date of the last bar
     assert chart["as_of"].startswith("2026-11-11T")  # reported in KST
+
+
+def test_the_hourly_fixture_stamps_bars_as_the_capture_did():
+    assert _new_york("11/10 15:00") == 1794340800
+    assert YAHOO_NQ_HOURLY["chart"]["result"][0]["timestamp"][-2] == 1794405600
+
+
+def test_futures_change_is_measured_from_the_last_us_cash_close():
+    """The capture itself: 09:30 New York on 11/11, before the cash open."""
+
+    chart = mc.parse_yahoo_futures(YAHOO_NQ_HOURLY)
+
+    assert chart["last"] == 28370.0
+    assert chart["prev_close"] == 27835.25  # 11/10's 15:00 bar, which ended at the close
+    assert chart["prev_close_as_of"] == "2026-11-11T06:00+09:00"
+    assert mc._futures_quote(chart, "x")["change_pct"] == 1.92
+
+
+def test_futures_baseline_is_todays_close_once_the_cash_session_has_ended():
+    """Brief time in Seoul. Yahoo's daily bar for 11/10 is still open here, so
+    the last two daily bars measure from 11/09's settlement (28,014.5) and
+    read -0.22% for a future that had risen since the close."""
+
+    chart = mc.parse_yahoo_futures(_hourly(seen="11/10 18:59", price=27952.75))
+
+    assert chart["prev_close"] == 27835.25
+    assert mc._futures_quote(chart, "x")["change_pct"] == 0.42
+    assert chart["last_date"] == "2026-11-10"  # New York's date
+    assert chart["as_of"] == "2026-11-11T08:59+09:00"
+
+
+def test_a_futures_bar_still_forming_at_the_close_is_not_its_own_baseline():
+    """15:30 New York: the 15:00 bar holds a live price, not a close."""
+
+    chart = mc.parse_yahoo_futures(_hourly(seen="11/10 15:30", price=27800.0))
+
+    assert chart["prev_close"] == 28004.75  # 11/09's close
+    assert chart["prev_close_as_of"] == "2026-11-10T06:00+09:00"
+
+
+def test_futures_on_sunday_evening_measure_from_fridays_close():
+    chart = mc.parse_yahoo_futures(_hourly(seen="11/08 18:30", price=26967.0))
+
+    assert chart["prev_close"] == 27076.5  # Friday's 15:00 bar, not the 16:00 one
+    assert chart["prev_close_as_of"] == "2026-11-07T06:00+09:00"
+
+
+def test_futures_with_no_bar_before_the_close_give_the_price_without_a_change():
+    chart = mc.parse_yahoo_futures(_hourly(NQ_HOURLY[-3:], seen="11/11 09:30", price=28370.0))
+
+    quote = mc._futures_quote(chart, "x")
+    assert quote["value"] == 28370.0
+    assert quote["prev_close"] is None and quote["change_pct"] is None
 
 
 def test_yahoo_krx_bars_are_dated_in_seoul_and_carry_the_1530_close():
@@ -180,6 +276,8 @@ def _transport(*, yahoo_ok: bool = True, counter: dict | None = None) -> httpx.M
         if host == "query1.finance.yahoo.com":
             if not yahoo_ok:
                 return httpx.Response(429, text="Too Many Requests")
+            if request.url.params.get("interval") == "60m":
+                return httpx.Response(200, json=YAHOO_NQ_HOURLY)
             return httpx.Response(200, json=YAHOO_069500 if ".KS" in request.url.path else YAHOO_NQ)
         if host == "cdn.cboe.com":
             return httpx.Response(200, text=CBOE_CSV)
@@ -205,8 +303,12 @@ def test_context_carries_every_leg_with_its_source():
 
     ctx = _build(kiwoom)
 
-    assert ctx["us"]["nasdaq100_futures"]["value"] == 28360.75
-    assert ctx["us"]["nasdaq100_futures"]["source"].startswith("Yahoo NQ=F")
+    futures = ctx["us"]["nasdaq100_futures"]
+    assert futures["value"] == 28370.0 and futures["change_pct"] == 1.92
+    assert futures["prev_close_as_of"] == "2026-11-11T06:00+09:00" and "마감" in futures["basis"]
+    assert futures["source"].startswith("Yahoo NQ=F")
+    # An index says which close its change is measured from.
+    assert ctx["us"]["nasdaq100"]["prev_close_date"] == "2026-11-10"
     assert ctx["vix"]["value"] == 19.46 and "Cboe" in ctx["vix"]["source"]
     assert ctx["usd_krw"]["reference"]["value"] == 1343.3
     assert ctx["etf"]["133690"] == {
@@ -257,6 +359,29 @@ def test_a_failing_source_is_not_retried_on_every_request():
     _build(None, yahoo_ok=False, counter=hits)
 
     assert hits["query1.finance.yahoo.com"] == first
+
+
+def test_a_source_that_hangs_is_remembered_as_failed(monkeypatch):
+    """Kiwoom's client waits ten seconds per phase. Cut off from outside, the
+    call was cancelled rather than failed, nothing was cached, and the next
+    request called Kiwoom and waited all over again."""
+
+    monkeypatch.setattr(mc, "LEG_TIMEOUT_SECONDS", 0.01)
+
+    class Hanging(_Kiwoom):
+        async def post(self, url, *, headers, json):
+            self.calls.append(json)
+            await asyncio.sleep(5)
+
+    kiwoom = Hanging()
+
+    first = _build(kiwoom)
+    second = _build(kiwoom)
+
+    assert "TimeoutError" in first["etf"]["069500"]["error"]
+    assert "TimeoutError" in second["etf"]["133690"]["error"]
+    assert len(kiwoom.calls) == 2  # one per ETF, and not asked again
+    assert first["vix"]["value"] == 19.46  # the rest still rendered
 
 
 def test_daily_closes_return_every_symbol_or_raise():

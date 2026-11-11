@@ -53,13 +53,18 @@ ECOS_URL = (
 
 # Yahoo symbols. Futures move while Korea trades; the cash indices are the
 # last US close the ETFs' NAV is built on.
-US_SYMBOLS = {
+US_INDEX_SYMBOLS = {
     "nasdaq100": "^NDX",
     "sp500": "^GSPC",
+}
+US_FUTURES_SYMBOLS = {
     "nasdaq100_futures": "NQ=F",
     "sp500_futures": "ES=F",
 }
 USD_KRW_SYMBOL = "KRW=X"
+
+# The US cash session ends at 16:00 New York time.
+US_CASH_CLOSE_HOUR = 16
 
 # Seconds each leg stays cached. Futures and FX move; a daily close and a
 # NAV do not change within the hour.
@@ -73,22 +78,29 @@ TTL_ETF_NAV = 1800
 # agent tab polls every 30 seconds — instead of once a minute.
 TTL_FAILURE = 60
 
+# One outbound call, start to finish. The limit sits inside the cache so that
+# running out of time is remembered like any other failure. A limit applied
+# from outside cancels the call instead, and a cancellation is not an
+# `Exception`: nothing would be cached, and a source that hangs — Kiwoom's
+# own client waits ten seconds per phase — would be called again, and waited
+# for again, on every request.
+LEG_TIMEOUT_SECONDS = HTTP_TIMEOUT_SECONDS + 2
+
 _cache: dict[str, tuple[float, Any, bool]] = {}
 
 
 async def _cached(key: str, ttl: float, fetch: Callable[[], Awaitable[Any]]) -> Any:
     hit = _cache.get(key)
-    now = time.monotonic()
-    if hit and hit[0] > now:
+    if hit and hit[0] > time.monotonic():
         if hit[2]:
             raise hit[1]
         return hit[1]
     try:
-        value = await fetch()
+        value = await asyncio.wait_for(fetch(), LEG_TIMEOUT_SECONDS)
     except Exception as exc:
-        _cache[key] = (now + TTL_FAILURE, exc, True)
+        _cache[key] = (time.monotonic() + TTL_FAILURE, exc, True)
         raise
-    _cache[key] = (now + ttl, value, False)
+    _cache[key] = (time.monotonic() + ttl, value, False)
     return value
 
 
@@ -144,7 +156,7 @@ def parse_yahoo_chart(payload: dict[str, Any]) -> dict[str, Any]:
         if isinstance(market_time, (int, float)) else None
     )
     last_day, last = bars[-1]
-    prev = bars[-2][1] if len(bars) > 1 else None
+    prev_day, prev = bars[-2] if len(bars) > 1 else (None, None)
     return {
         "symbol": meta.get("symbol"),
         "currency": meta.get("currency"),
@@ -152,7 +164,68 @@ def parse_yahoo_chart(payload: dict[str, Any]) -> dict[str, Any]:
         "last": last,
         "last_date": last_day,
         "prev_close": prev,
+        "prev_close_date": prev_day,
         "as_of": as_of,
+    }
+
+
+def parse_yahoo_futures(payload: dict[str, Any]) -> dict[str, Any]:
+    """Latest futures price against its level at the last US cash close.
+
+    Takes *hourly* bars, because daily ones cannot answer this. Yahoo dates
+    a future's daily bar by the New York calendar day, and a finished day's
+    close is its settlement near 16:00. From 16:00 until midnight New York
+    — 06:00 to 14:00 in Seoul, which is when the pre-open brief runs — the
+    newest daily bar is still that same day, so "the last two daily bars"
+    measures from the settlement *before* the session that just closed.
+    Replayed on the 2026-11-11 capture at 19:00 New York on 11/10 (09:00
+    KST), that reads -0.2% while the future stood +0.4% above its level at
+    the close: the wrong sign for the one number the brief wants from it.
+
+    The baseline is the last hourly bar that ended at or before the most
+    recent weekday 16:00 New York. That is the future as the cash index
+    closed, so the change always means "since the US close" — and on a
+    13:00 half day it is the last trade before the early halt.
+    """
+
+    result = ((payload or {}).get("chart") or {}).get("result") or []
+    if not result:
+        error = ((payload or {}).get("chart") or {}).get("error")
+        raise ValueError(f"Yahoo chart 응답에 결과가 없다: {error}")
+    body = result[0]
+    meta = body.get("meta") or {}
+    tz = ZoneInfo(meta.get("exchangeTimezoneName") or "America/New_York")
+    stamps = body.get("timestamp") or []
+    closes = (((body.get("indicators") or {}).get("quote") or [{}])[0]).get("close") or []
+    bars = [(int(stamp), float(close)) for stamp, close in zip(stamps, closes) if close is not None]
+    if not bars:
+        raise ValueError("Yahoo chart 응답에 종가가 없다")
+    market_time = meta.get("regularMarketTime")
+    if not isinstance(market_time, (int, float)):
+        market_time = bars[-1][0]
+    price = meta.get("regularMarketPrice")
+    last = float(price) if isinstance(price, (int, float)) else bars[-1][1]
+
+    seen = datetime.fromtimestamp(market_time, tz)
+    cash_close = seen.replace(hour=US_CASH_CLOSE_HOUR, minute=0, second=0, microsecond=0)
+    while cash_close > seen or cash_close.weekday() >= 5:
+        cash_close -= timedelta(days=1)
+    cutoff = cash_close.timestamp()
+    # Only bars that had finished by then. The bar still forming — and the
+    # live point Yahoo appends, stamped with the quote time — start too late.
+    base = None
+    for start, close in bars:
+        if start + 3600 <= cutoff:
+            base = (start + 3600, close)
+    return {
+        "symbol": meta.get("symbol"),
+        "last": last,
+        "last_date": seen.date().isoformat(),
+        "as_of": datetime.fromtimestamp(market_time, KST).isoformat(timespec="minutes"),
+        "prev_close": base[1] if base else None,
+        "prev_close_as_of": (
+            datetime.fromtimestamp(base[0], KST).isoformat(timespec="minutes") if base else None
+        ),
     }
 
 
@@ -170,11 +243,40 @@ async def _yahoo_chart(
     return await _cached(f"yahoo:{symbol}:{range_}", ttl, fetch)
 
 
+async def _yahoo_futures(http: httpx.AsyncClient, symbol: str, *, ttl: float) -> dict[str, Any]:
+    async def fetch() -> dict[str, Any]:
+        response = await http.get(
+            YAHOO_CHART_URL.format(symbol=symbol),
+            params={"range": "5d", "interval": "60m"},
+        )
+        response.raise_for_status()
+        return parse_yahoo_futures(response.json())
+
+    return await _cached(f"yahoo-futures:{symbol}", ttl, fetch)
+
+
 def _quote(chart: dict[str, Any], source: str) -> dict[str, Any]:
     return {
         "value": _round(chart["last"]),
         "prev_close": _round(chart["prev_close"]),
+        "prev_close_date": chart["prev_close_date"],
         "change_pct": _change_pct(chart["last"], chart["prev_close"]),
+        "date": chart["last_date"],
+        "as_of": chart["as_of"],
+        "source": source,
+    }
+
+
+FUTURES_BASIS = "change_pct는 가장 최근 미국 정규장 마감(뉴욕 16:00) 때의 선물가 대비다"
+
+
+def _futures_quote(chart: dict[str, Any], source: str) -> dict[str, Any]:
+    return {
+        "value": _round(chart["last"]),
+        "prev_close": _round(chart["prev_close"]),
+        "prev_close_as_of": chart["prev_close_as_of"],
+        "change_pct": _change_pct(chart["last"], chart["prev_close"]),
+        "basis": FUTURES_BASIS,
         "date": chart["last_date"],
         "as_of": chart["as_of"],
         "source": source,
@@ -349,8 +451,9 @@ def _http_client() -> httpx.AsyncClient:
 
 
 async def _settle(name: str, coro: Awaitable[Any]) -> tuple[str, Any]:
+    # Every leg is bounded inside `_cached`, where a timeout is remembered.
     try:
-        return name, await asyncio.wait_for(coro, HTTP_TIMEOUT_SECONDS + 2)
+        return name, await coro
     except Exception as exc:  # noqa: BLE001 - each leg fails alone
         return name, {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
 
@@ -358,6 +461,9 @@ async def _settle(name: str, coro: Awaitable[Any]) -> tuple[str, Any]:
 NOTE = (
     "참고용이다. watcher는 이 값을 읽지 않으며 주문은 이 값과 무관하다. "
     "인용할 때 source와 date·as_of를 함께 적어라. "
+    "등락률의 기준이 항목마다 다르다. 지수·환율의 change_pct는 직전 일봉 종가(prev_close_date) 대비이고, "
+    "선물의 change_pct는 가장 최근 미국 정규장 마감 때의 선물가(prev_close_as_of) 대비다. "
+    "그래서 미국 장이 끝난 뒤의 선물 등락률은 지수의 당일 등락에 더해진 마감 이후 움직임이다. "
     "ETF NAV는 국내 장 마감 기준이고, 미국 지수 ETF의 NAV는 전일 미국 종가 기준이라 "
     "장중 괴리율에는 밤사이 선물·환율 이동이 섞인다."
 )
@@ -375,8 +481,10 @@ async def build_market_context(
 
     async def run(client: httpx.AsyncClient) -> dict[str, Any]:
         legs: list[Awaitable[tuple[str, Any]]] = []
-        for key, symbol in US_SYMBOLS.items():
+        for key, symbol in US_INDEX_SYMBOLS.items():
             legs.append(_settle(key, _yahoo_chart(client, symbol, range_="5d", ttl=TTL_LIVE)))
+        for key, symbol in US_FUTURES_SYMBOLS.items():
+            legs.append(_settle(key, _yahoo_futures(client, symbol, ttl=TTL_LIVE)))
         legs.append(_settle("usd_krw_market", _yahoo_chart(client, USD_KRW_SYMBOL, range_="5d", ttl=TTL_LIVE)))
         legs.append(_settle("vix", _cboe_vix(client)))
         legs.append(_settle("usd_krw_reference", _ecos_usdkrw(client, now.date())))
@@ -391,17 +499,17 @@ async def build_market_context(
         async with _http_client() as client:
             got = await run(client)
 
-    def yahoo(key: str, source: str) -> dict[str, Any]:
+    def yahoo(key: str, source: str, shape: Callable[[dict[str, Any], str], dict[str, Any]] = _quote) -> dict[str, Any]:
         value = got.get(key)
         if isinstance(value, dict) and "error" in value:
             return {**value, "source": source}
-        return _quote(value, source)
+        return shape(value, source)
 
     us = {
         "nasdaq100": yahoo("nasdaq100", "Yahoo ^NDX (비공식)"),
         "sp500": yahoo("sp500", "Yahoo ^GSPC (비공식)"),
-        "nasdaq100_futures": yahoo("nasdaq100_futures", "Yahoo NQ=F 근월물 (비공식)"),
-        "sp500_futures": yahoo("sp500_futures", "Yahoo ES=F 근월물 (비공식)"),
+        "nasdaq100_futures": yahoo("nasdaq100_futures", "Yahoo NQ=F 근월물 (비공식)", _futures_quote),
+        "sp500_futures": yahoo("sp500_futures", "Yahoo ES=F 근월물 (비공식)", _futures_quote),
     }
     etf: dict[str, Any] = {}
     if kiwoom_client is None:
@@ -431,4 +539,5 @@ __all__ = [
     "parse_ecos_usdkrw",
     "parse_etf_daily_trend",
     "parse_yahoo_chart",
+    "parse_yahoo_futures",
 ]

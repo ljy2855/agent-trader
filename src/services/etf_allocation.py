@@ -84,7 +84,10 @@ async def plan_etf_allocation(client, settings, *, holding_observer=None,
                               stock_detail_cache_ttl_seconds=75, now=None, **_):
     """Publish a read-only plan in the shape consumed by IntradayWatcher."""
     from . import account, market
-    from .strategy import _normalize_holding_rows, _build_market_regime, _to_price, _extract_open_order_codes
+    from .strategy import (
+        _normalize_holding_rows, _build_market_regime, _to_price, _extract_open_order_codes,
+        _degraded_sources,
+    )
 
     if position_budget_pct != TARGET_PCT or max_positions != 2:
         raise ValueError("etf_allocation requires position_budget_pct=47 and max_positions=2")
@@ -124,15 +127,33 @@ async def plan_etf_allocation(client, settings, *, holding_observer=None,
     if any(details.get(c, {}).get("success") is not True for c in TARGETS):
         raise ValueError("ETF 시세 조회 불완전")
     deltas = allocation_orders(assets=assets, holdings=holdings, prices=prices, now=now)
-    healthy = bool(
-        snapshot.get("success") and orders.get("success") and not orders.get("warning")
+    orders_complete = bool(
+        orders.get("success") and not orders.get("warning")
         and isinstance(orders.get("unexecuted_orders_data"), list)
-        and regime.get("market_data_complete")
     )
+    healthy = bool(snapshot.get("success") and orders_complete and regime.get("market_data_complete"))
+    # Say which read held the plan back. Without this the watcher records
+    # only "success=false (no source breakdown)" — every open tick since the
+    # switch — and a plan skipped at 15:20 on a rebalancing day would read
+    # the same.
+    degraded: list[dict[str, Any]] = []
     if not healthy:
         deltas = {"buys": [], "sells": []}  # routine rebalancing waits; hard exits ran above
+        degraded = _degraded_sources(evaluation, snapshot)
+        if not orders_complete:
+            cause = orders.get("warning") or orders.get("error") or orders.get("return_msg")
+            degraded.append({"source": "unexecuted_orders", "error": cause or "응답 불완전"})
+        if not degraded:
+            # Every read answered, yet the index data is not usable — the
+            # open tick, before the exchange has counted rising and falling
+            # issues, looks like this.
+            degraded.append(
+                {"source": "market_regime", "error": "지수·등락 종목 수 불완전"}
+                if not regime.get("market_data_complete") else {"source": "market_snapshot"}
+            )
     return {
         "success": healthy, "strategy_name": MODE, "regime": regime,
+        "degraded_sources": degraded,
         "portfolio": {
             "estimated_assets": assets, "position_budget": floor(assets * TARGET_PCT / 100),
             "max_positions": 2, "max_new_positions": 2, "holding_count": len(holdings),

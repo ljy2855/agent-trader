@@ -121,13 +121,13 @@ def test_planner_reads_broker_shaped_rows_and_preserves_protective_observation(m
     assert observed[0]["quantity"] == 1
 
 
-@pytest.mark.parametrize("orders, market_success", [
-    ({"success": False, "unexecuted_orders_data": []}, True),
-    ({"success": True}, True),
-    ({"success": True, "unexecuted_orders_data": [], "warning": "pagination incomplete"}, True),
-    ({"success": True, "unexecuted_orders_data": []}, False),
+@pytest.mark.parametrize("orders, market_success, named", [
+    ({"success": False, "unexecuted_orders_data": []}, True, "unexecuted_orders"),
+    ({"success": True}, True, "unexecuted_orders"),
+    ({"success": True, "unexecuted_orders_data": [], "warning": "pagination incomplete"}, True, "unexecuted_orders"),
+    ({"success": True, "unexecuted_orders_data": []}, False, "market_snapshot"),
 ])
-def test_incomplete_market_or_orders_blocks_routine_migration_but_observes_holdings(monkeypatch, orders, market_success):
+def test_incomplete_market_or_orders_blocks_routine_migration_but_observes_holdings(monkeypatch, orders, market_success, named):
     observed = []
     stub_plan_sources(monkeypatch, orders=orders, market_success=market_success)
 
@@ -138,6 +138,31 @@ def test_incomplete_market_or_orders_blocks_routine_migration_but_observes_holdi
     assert result["success"] is False
     assert result["allocation"] == {"sells": [], "buys": []}
     assert observed[0]["quantity"] == 1
+    # The plan names the read that held it back; the watcher's failure
+    # detail is built from this and said "no source breakdown" without it.
+    assert [entry["source"] for entry in result["degraded_sources"]] == [named]
+
+
+def test_a_healthy_plan_names_no_degraded_source(monkeypatch):
+    stub_plan_sources(monkeypatch)
+
+    result = asyncio.run(plan_etf_allocation(None, None))
+
+    assert result["success"] is True and result["degraded_sources"] == []
+
+
+def test_the_watcher_failure_detail_names_the_etf_plans_failed_read(monkeypatch):
+    from src.services.watcher import _describe_degraded_sources
+
+    stub_plan_sources(monkeypatch, orders={
+        "success": True, "unexecuted_orders_data": [], "warning": "pagination incomplete",
+    })
+
+    result = asyncio.run(plan_etf_allocation(None, None))
+
+    assert _describe_degraded_sources(result) == (
+        "planner degraded — unexecuted_orders: pagination incomplete"
+    )
 
 
 @pytest.mark.parametrize("holdings", [
