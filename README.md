@@ -167,6 +167,7 @@ uv run python main_watcher.py --entry-mode etf_allocation \
 
 이 예시는 dry-run이다. 실주문은 기존 두 단계 live 스위치를 적용한다.
 ETF 매수는 증거금 100% 기준 주문가능수량을 추가 확인하며 조회 실패 시 보류한다.
+극단적 시장 약세 거부권은 개별주식 전략의 규칙이라 ETF 배분 매수에는 적용하지 않는다. 시장 데이터가 불완전하면 보류한다.
 LLM의 승인·청산 판단, MA 눌림목 점수, 개별주식용 손절·익절은 ETF에 적용하지 않는다.
 ETF의 시장 하락 손실을 감수하는 장기 배분 방식이며 특정 월수익을 보장하지 않는다.
 기존 개별주식의 손절·익절과 주문취소는 전환 중에도 유지한다.
@@ -256,7 +257,8 @@ src/
     order_ledger.py, order_result.py        원장, 대사, 주문 결과 상태
     daily_risk.py, krx_calendar.py          circuit breaker, 거래일 캘린더
     realtime_stream.py, realtime_orders.py  WebSocket 체결 이벤트
-    benchmark.py, candidate_journal.py      계좌 대 지수 비교, 후보 점수 기록
+    benchmark.py, candidate_journal.py      계좌 대 지수·목표 배분 비교, 후보 점수 기록
+    market_context.py                       agent 참고용 외부 지표 (미국 지수·선물, VIX, 환율, ETF NAV). 주문 경로는 읽지 않는다
 automation/           운영 스크립트: Discord 브리핑과 점검, health check, 체결 기록, 신호 검증
 backtest/             오프라인 simulator와 검증 통계
 tests/                pytest. 네트워크 없이 돈다

@@ -256,9 +256,31 @@ def build_comparison(
     from reading as the answer.
     """
 
+    return compare_series(
+        account_points,
+        index_series(index_bars),
+        max_daily_move_pct=max_daily_move_pct,
+        trailing_windows=trailing_windows,
+    )
+
+
+def compare_series(
+    account_points: list[dict[str, Any]],
+    idx: dict[str, float],
+    *,
+    max_daily_move_pct: float = MAX_PLAUSIBLE_DAILY_MOVE_PCT,
+    trailing_windows: tuple[int, ...] = TRAILING_WINDOWS,
+    with_exposure: bool = True,
+) -> dict[str, Any]:
+    """`build_comparison` over any {YYYY-MM-DD: level} series.
+
+    ``with_exposure`` adds the cash/selection split, which only makes sense
+    against a fully invested market: a benchmark that already holds cash
+    (the target allocation) would be scaled down twice.
+    """
+
     acct = account_series(account_points)
-    idx = index_series(index_bars)
-    expo = exposure_series(account_points) or None
+    expo = (exposure_series(account_points) or None) if with_exposure else None
     days = sorted(set(acct) & set(idx))
 
     if len(days) < 2:
@@ -349,4 +371,79 @@ def build_comparison(
             "잡히므로 매수 직후를 과소평가한다 — 분해 비율은 ±1%p 정도 "
             "흔들리지만 어느 쪽 항이 큰지는 바뀌지 않는다."
         )
+    return out
+
+
+def weighted_portfolio_series(
+    closes: dict[str, dict[str, float]],
+    weights: dict[str, float],
+    *,
+    base: float = 100.0,
+) -> dict[str, float]:
+    """Level of a portfolio held at fixed weights, the remainder in cash.
+
+    Rebalanced to the weights every day, which over a few weeks differs from
+    the live rule (rebalance only in days 1–7, and only 10%p off target) by
+    far less than a share of either ETF. Cash earns nothing. Only days on
+    which every holding has a close are used.
+    """
+
+    if not weights or any(code not in closes for code in weights):
+        return {}
+    days = sorted(set.intersection(*(set(closes[code]) for code in weights)))
+    if not days:
+        return {}
+    level = base
+    out = {days[0]: level}
+    for prev, cur in zip(days, days[1:]):
+        day_return = 0.0
+        for code, weight in weights.items():
+            p0, p1 = closes[code][prev], closes[code][cur]
+            if p0 <= 0:
+                return {}
+            day_return += weight * (p1 / p0 - 1.0)
+        level *= 1.0 + day_return
+        out[cur] = level
+    return out
+
+
+def build_allocation_comparison(
+    account_points: list[dict[str, Any]],
+    closes: dict[str, dict[str, float]],
+    weights: dict[str, float],
+    *,
+    names: dict[str, str] | None = None,
+    source: str = "",
+    max_daily_move_pct: float = MAX_PLAUSIBLE_DAILY_MOVE_PCT,
+    trailing_windows: tuple[int, ...] = TRAILING_WINDOWS,
+) -> dict[str, Any]:
+    """The account against the allocation it is meant to hold.
+
+    Against KOSPI alone, an account holding 47% Korea, 47% Nasdaq-100 and
+    cash shows the gap between those markets as its "alpha" — the 11/11
+    wrap reported +19.6%p that was mostly the cash and the US leg. This
+    leg leaves only what the account itself adds or loses: whole shares,
+    the cash it carries, timing and costs. ``index_*`` fields here are the
+    target portfolio's level, starting at 100.
+    """
+
+    series = weighted_portfolio_series(closes, weights)
+    names = names or {}
+    label = " + ".join(
+        f"{names.get(code, code)} {weight * 100:g}%" for code, weight in weights.items()
+    )
+    cash = round((1.0 - sum(weights.values())) * 100, 1)
+    if cash > 0:
+        label += f" + 현금 {cash:g}%"
+    out = compare_series(
+        account_points,
+        series,
+        max_daily_move_pct=max_daily_move_pct,
+        trailing_windows=trailing_windows,
+        with_exposure=False,
+    )
+    out["label"] = f"목표 배분 ({label}, 매일 리밸런스 가정)"
+    out["weights"] = weights
+    if source:
+        out["source"] = source
     return out

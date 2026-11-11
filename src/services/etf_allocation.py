@@ -142,7 +142,9 @@ async def plan_etf_allocation(client, settings, *, holding_observer=None,
         },
         "holdings": holdings, "allocation": deltas, "allocation_prices": prices,
         "candidate_rows": [
-            {**r, "eligible": not regime.get("extreme_risk_off"), "score": 100,
+            # Always eligible: a crash day does not veto an allocation buy, and
+            # incomplete market data has already emptied `deltas` above.
+            {**r, "eligible": True, "score": 100,
              "entry_price": str(int(r["current_price"])), "entry_order_type_code": "0"}
             for r in deltas["buys"]
         ],

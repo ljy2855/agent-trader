@@ -279,7 +279,7 @@ class KiwoomMCPServer:
         @self.mcp.custom_route("/api/agent_overview", methods=["GET"])
         async def agent_overview_api(_: Request) -> JSONResponse:
             try:
-                payload = await build_agent_overview()
+                payload = await build_agent_overview(self._client)
                 return JSONResponse(payload)
             except Exception as exc:
                 return JSONResponse(

@@ -610,3 +610,90 @@ def test_dashboard_routes_render_with_loader_override() -> None:
         assert api_response.json()["environment"]["mode"] == "mock"
 
     assert captured == {"start_date": "20260301", "end_date": "20260324"}
+
+
+def _allocation_snapshot(monkeypatch, closes=None):
+    """A snapshot with a three-day asset series and nothing else."""
+
+    def empty(api_id: str, key: str):
+        async def fake(*_args, **_kwargs):
+            return _ok(api_id, key, [])
+        return fake
+
+    for name, api_id, key in (
+        ("get_account_evaluation", "kt00004", "evaluation_data"),
+        ("get_account_current_status", "kt00017", "daily_status_data"),
+        ("get_daily_account_profit_detail", "kt00016", "profit_detail_data"),
+        ("get_period_realized_profit", "ka10073", "realized_profit_data"),
+        ("get_daily_trading_journal", "ka10170", "trading_journal_data"),
+        ("get_execution_info", "ka10076", "execution_data"),
+        ("get_order_execution_status", "kt00009", "order_execution_status_data"),
+        ("get_unexecuted_orders", "ka10075", "unexecuted_orders_data"),
+        ("get_trade_history", "kt00015", "trade_history_data"),
+    ):
+        monkeypatch.setattr(dashboard_module.account, name, empty(api_id, key))
+
+    async def assets(*_args, **_kwargs):
+        return _ok("kt00002", "daily_estimated_asset_data", [
+            {"dt": "20261109", "prsm_dpst_aset_amt": "1000000"},
+            {"dt": "20261110", "prsm_dpst_aset_amt": "1040000"},
+            {"dt": "20261111", "prsm_dpst_aset_amt": "1060800"},
+        ])
+
+    monkeypatch.setattr(dashboard_module.account, "get_daily_estimated_asset", assets)
+    monkeypatch.setattr(dashboard_module.market, "get_index_daily_bars", empty("ka20006", "index_daily_bars"))
+    monkeypatch.setattr(dashboard_module, "_today_ymd", lambda: "20261111")
+    if closes is not None:
+        async def fetch(symbols, **_kwargs):
+            assert symbols == {"069500": "069500.KS", "133690": "133690.KS"}
+            return closes
+        monkeypatch.setattr(dashboard_module.market_context, "fetch_daily_closes", fetch)
+
+    return asyncio.run(
+        dashboard_module.build_dashboard_snapshot(
+            client=object(),
+            settings=SimpleNamespace(use_mock=False, active_base_url="https://api.kiwoom.com/"),
+            start_date="20261101",
+            end_date="20261111",
+        )
+    )
+
+
+def test_benchmark_carries_the_target_allocation_from_non_kiwoom_closes(monkeypatch) -> None:
+    """The account against 47% KODEX 200 + 47% TIGER 미국나스닥100, priced
+    from Yahoo's KRX closes so the comparison costs no Kiwoom calls."""
+
+    days = ["2026-11-09", "2026-11-10", "2026-11-11"]
+    payload = _allocation_snapshot(monkeypatch, closes={
+        "069500": dict(zip(days, [100.0, 110.0, 110.0])),   # +10%, flat
+        "133690": dict(zip(days, [200.0, 200.0, 220.0])),   # flat, +10%
+    })
+
+    target = payload["benchmark"]["target_allocation"]
+    assert target["available"] is True
+    # Account: +4.0% then +2.0% = +6.08%. Target: +4.7% twice = +9.62%.
+    assert target["account_return_pct"] == 6.08
+    assert target["index_return_pct"] == 9.62
+    assert target["alpha_pct"] == -3.54
+    assert "KODEX 200 47%" in target["label"] and "현금 6%" in target["label"]
+
+    card = {c["label"]: c for c in payload["performance"]}["목표 배분 대비"]
+    assert card["value"] == -3.54 and card["tone"] == "negative"
+    assert "계좌 +6.08%" in card["detail"] and "2거래일" in card["detail"]
+
+    source = {s["title"]: s for s in payload["sources"]}["목표 배분 ETF 일봉 (Yahoo, 벤치마크)"]
+    assert source["status"] == "ok" and source["api_id"] == "yahoo:069500.KS,133690.KS"
+
+
+def test_target_allocation_failure_is_reported_and_breaks_nothing(monkeypatch) -> None:
+    """With the outside feed down (the suite default) the page still builds,
+    the leg says why, and the source row shows the error."""
+
+    payload = _allocation_snapshot(monkeypatch)
+
+    target = payload["benchmark"]["target_allocation"]
+    assert target["available"] is False and "조회 실패" in target["reason"]
+    card = {c["label"]: c for c in payload["performance"]}["목표 배분 대비"]
+    assert card["value"] == ""  # the UI hides cards without a value
+    source = {s["title"]: s for s in payload["sources"]}["목표 배분 ETF 일봉 (Yahoo, 벤치마크)"]
+    assert source["status"] == "error"

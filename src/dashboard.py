@@ -18,7 +18,7 @@ from starlette.routing import Route
 from .agent_overview import build_agent_overview
 from .config import Settings, get_settings
 from .dashboard_template import DASHBOARD_HTML
-from .services import account, benchmark, krx_calendar, market
+from .services import account, benchmark, etf_allocation, krx_calendar, market, market_context
 from .services.kiwoom_client import KiwoomClient
 
 KST = ZoneInfo("Asia/Seoul")
@@ -436,6 +436,62 @@ def _realized_table_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return table
 
 
+
+def _target_allocation_card(comparison: dict[str, Any]) -> dict[str, Any]:
+    """Performance card: the account against the allocation it should hold."""
+
+    card: dict[str, Any] = {"label": "목표 배분 대비", "kind": "ratio", "tone": "neutral", "value": ""}
+    if not comparison.get("available"):
+        card["detail"] = comparison.get("reason") or ""
+        return card
+    gap = comparison.get("alpha_pct")
+    card["value"] = gap
+    if isinstance(gap, (int, float)):
+        card["tone"] = "positive" if gap > 0 else ("negative" if gap < 0 else "neutral")
+    card["detail"] = (
+        f"계좌 {comparison.get('account_return_pct'):+.2f}% · 목표 배분 "
+        f"{comparison.get('index_return_pct'):+.2f}% · {comparison.get('compared_days')}거래일 "
+        f"({comparison.get('start_date')}~{comparison.get('end_date')}, %p 차이)"
+    )
+    return card
+
+
+async def _target_allocation_closes() -> dict[str, Any]:
+    """Daily KRX closes of the allocation's ETFs, shaped like a source result."""
+
+    symbols = {code: f"{code}.KS" for code in etf_allocation.TARGETS}
+    api_id = "yahoo:" + ",".join(symbols.values())
+    try:
+        closes = await market_context.fetch_daily_closes(symbols)
+    except Exception as exc:  # noqa: BLE001 - a benchmark leg must not break the page
+        return {"success": False, "api_id": api_id, "message": f"{type(exc).__name__}: {exc}"[:200]}
+    return {
+        "success": True,
+        "api_id": api_id,
+        "message": "Yahoo 일봉 (비공식)",
+        "closes": closes,
+        "total_records": sum(len(days) for days in closes.values()),
+    }
+
+
+def _target_allocation_comparison(
+    account_points: list[dict[str, Any]], closes_result: dict[str, Any]
+) -> dict[str, Any]:
+    if not closes_result.get("success"):
+        return {
+            "available": False,
+            "reason": f"목표 배분 ETF 일봉 조회 실패: {closes_result.get('message')}",
+        }
+    weights = {code: etf_allocation.TARGET_PCT / 100 for code in etf_allocation.TARGETS}
+    return benchmark.build_allocation_comparison(
+        account_points,
+        closes_result["closes"],
+        weights,
+        names=etf_allocation.TARGETS,
+        source="Yahoo 일봉 — KRX 15:30 종가 (비공식)",
+    )
+
+
 async def build_dashboard_snapshot(
     client: KiwoomClient,
     settings: Settings,
@@ -469,6 +525,7 @@ async def build_dashboard_snapshot(
         unexecuted_result,
         asset_series_result,
         index_bars_result,
+        allocation_closes_result,
         trade_history_result,
         *journal_results,
     ) = await asyncio.gather(
@@ -485,6 +542,10 @@ async def build_dashboard_snapshot(
         # comparison needs never paginates. `inds_cd` is required — omitting
         # it is answered with 1511, the same shape as the ka10075 outage.
         market.get_index_daily_bars(client, inds_cd="001", base_date=end_date),
+        # Second benchmark leg: the target ETF allocation. From Yahoo, not
+        # Kiwoom — it spares the app key's rate limit, and its .KS closes are
+        # KRX's 15:30 closes where Kiwoom's daily bars end near 20:00.
+        _target_allocation_closes(),
         account.get_trade_history(client, trades_start, history_end),
         *(account.get_daily_trading_journal(client, base_dt=day) for day in journal_days),
     )
@@ -527,6 +588,10 @@ async def build_dashboard_snapshot(
         asset_series.get("points") or [],
         index_bars,
         benchmark_summary.get("excluded_days") or [],
+    )
+    benchmark_summary["target_allocation"] = _target_allocation_comparison(
+        asset_series.get("points") or [],
+        allocation_closes_result,
     )
 
     holdings_rows: list[dict[str, Any]] = []
@@ -652,6 +717,7 @@ async def build_dashboard_snapshot(
         # A silent index failure would make the benchmark quietly vanish
         # rather than say why, so it gets a source row like every other leg.
         ("KOSPI 일봉 (벤치마크)", index_bars_result),
+        ("목표 배분 ETF 일봉 (Yahoo, 벤치마크)", allocation_closes_result),
         ("매매 이력 (결제분)", trade_history_result),
         *((f"매매일지 {day[4:6]}/{day[6:]}", result) for day, result in zip(journal_days, journal_results)),
     ]:
@@ -990,6 +1056,7 @@ async def build_dashboard_snapshot(
                 f"기준자산 {asset_base:,}원 대비" if asset_base else ""
             ),
         },
+        _target_allocation_card(benchmark_summary.get("target_allocation") or {}),
         {
             "label": "거래 통계",
             "value": (
@@ -1182,9 +1249,9 @@ def create_dashboard_app(
         )
         return JSONResponse(payload)
 
-    async def agent_overview_api(_: Request) -> JSONResponse:
+    async def agent_overview_api(request: Request) -> JSONResponse:
         try:
-            payload = await build_agent_overview()
+            payload = await build_agent_overview(request.app.state.kiwoom_client)
             return JSONResponse(payload)
         except Exception as exc:
             return JSONResponse(

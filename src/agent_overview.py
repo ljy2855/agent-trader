@@ -41,7 +41,7 @@ from typing import Any
 
 import httpx
 
-from .services import krx_calendar
+from .services import krx_calendar, market_context
 from .services.strategy import BELOW_MA_MAX_DIP_PCT
 from .services.agent_timeline import build_rows, normalize_stock_code
 
@@ -474,10 +474,18 @@ def market_session_overview(now: datetime | None = None) -> dict[str, Any]:
     }
 
 
-async def build_agent_overview() -> dict[str, Any]:
-    watcher, autopilot = await asyncio.gather(
+async def _market_context(kiwoom_client: Any) -> dict[str, Any]:
+    try:
+        return await market_context.build_market_context(kiwoom_client)
+    except Exception as exc:  # noqa: BLE001 - the overview must still render
+        return {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+
+
+async def build_agent_overview(kiwoom_client: Any = None) -> dict[str, Any]:
+    watcher, autopilot, market = await asyncio.gather(
         fetch_watcher_status(),
         fetch_autopilot_status(),
+        _market_context(kiwoom_client),
     )
     return {
         "generated_at": datetime.now(KST).isoformat(),
@@ -490,6 +498,9 @@ async def build_agent_overview() -> dict[str, Any]:
         },
         "watcher": watcher,
         "autopilot": autopilot,
+        # Reference data for the brief and wrap (US indices and futures, VIX,
+        # USD/KRW, the ETFs' NAV and premium). Not read by the watcher.
+        "market_context": market,
     }
 
 

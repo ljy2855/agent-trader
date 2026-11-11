@@ -7034,6 +7034,53 @@ def test_etf_cannot_buy_with_missing_or_bad_cash_allowance(monkeypatch, cash_res
     assert w._ledger.unresolved() == []
 
 
+@pytest.mark.parametrize("regime, bought", [
+    # A crash day: the stock strategies' veto does not cancel an allocation buy.
+    ({"market_data_complete": True, "extreme_risk_off": True}, True),
+    # Cannot see the market: still no buy. `extreme_risk_off` is also true
+    # here (it means "crash OR blind"), which is why the two are told apart.
+    ({"market_data_complete": False, "extreme_risk_off": True}, False),
+])
+def test_etf_buy_ignores_the_crash_veto_but_not_missing_market_data(monkeypatch, regime, bought):
+    from src.services import account
+    buys = _record_buys(monkeypatch)
+    w = _etf_watcher(execute_orders=True)
+    w._prev_regime = regime
+    _stub_still_valid(w, _auction_detail(100_000))
+
+    async def cash(*args, **kwargs):
+        return {"success": True, "orderable_amount_data": [{
+            "profa_100ord_alow_amt": "000000205000", "profa_100ord_alowq": "0000000002",
+        }]}
+
+    monkeypatch.setattr(account, "get_orderable_amount", cash)
+    event = replace(_auction_candidate("069500", price=100_000), trigger_type="etf_allocation_buy", target_role=ROLE_SELF)
+
+    asyncio.run(w._handle_trigger(event, planner_result=_etf_plan()))
+
+    assert (len(buys) == 1) is bought
+
+
+def test_stock_strategy_still_refuses_to_buy_on_a_crash_day(monkeypatch):
+    """The veto was lifted for the allocation only."""
+
+    buys = _record_buys(monkeypatch)
+    w = _auction_watcher(_at(15, 21), entry_mode="below_ma", execute_orders=True)
+    w._prev_regime = {"market_data_complete": True, "extreme_risk_off": True}
+    _stub_still_valid(w, _auction_detail(287_000))
+
+    result = asyncio.run(
+        w._submit_candidate_buy(
+            _auction_candidate(), "TIER1",
+            {"portfolio": {"position_budget": 600_000, "max_positions": 2}, "holdings": []},
+            close_auction=True,
+        )
+    )
+
+    assert buys == []
+    assert result.state == "skipped" and "극단적 시장 약세" in (result.reason or "")
+
+
 def test_etf_buy_cannot_bypass_new_entry_pause_or_auction_window(monkeypatch):
     buys = _record_buys(monkeypatch)
     w = _etf_watcher(new_entries_enabled=False)

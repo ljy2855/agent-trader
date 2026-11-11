@@ -367,3 +367,111 @@ def test_a_single_overlapping_day_reports_unavailable_not_zero():
 
 def test_empty_input_is_unavailable():
     assert benchmark.build_comparison([], [])["available"] is False
+
+
+# --- the allocation the account is meant to hold ----------------------------
+#
+# Against KOSPI alone, an account at 47% Korea / 47% Nasdaq-100 / cash shows
+# the gap between those markets as "alpha": the 2026-11-11 wrap reported
+# +19.6%p that was mostly cash and the US leg.
+
+DAYS = ["2026-11-09", "2026-11-10", "2026-11-11"]
+WEIGHTS = {"069500": 0.47, "133690": 0.47}
+
+
+def _closes(kodex: list[float], tiger: list[float], days: list[str] = DAYS) -> dict:
+    return {"069500": dict(zip(days, kodex)), "133690": dict(zip(days, tiger))}
+
+
+def test_target_portfolio_moves_by_the_weighted_sum_and_its_cash_stays_flat():
+    """+10% on one leg at 47% is +4.7% on the portfolio; the 6% cash earns 0."""
+
+    series = benchmark.weighted_portfolio_series(
+        _closes([100, 110, 110], [200, 200, 180]), WEIGHTS
+    )
+
+    assert series["2026-11-09"] == 100.0
+    assert round(series["2026-11-10"], 4) == 104.7
+    assert round(series["2026-11-11"], 4) == round(104.7 * (1 - 0.047), 4)
+
+
+def test_target_portfolio_uses_only_days_every_holding_has():
+    """A day one ETF did not print is skipped, not filled with a stale price."""
+
+    closes = {
+        "069500": {"2026-11-09": 100, "2026-11-10": 105, "2026-11-11": 110},
+        "133690": {"2026-11-09": 200, "2026-11-11": 220},
+    }
+
+    series = benchmark.weighted_portfolio_series(closes, WEIGHTS)
+
+    assert sorted(series) == ["2026-11-09", "2026-11-11"]
+    assert round(series["2026-11-11"], 4) == 109.4  # 100 * (1 + .47*.10 + .47*.10)
+
+
+def test_target_portfolio_is_empty_when_a_holding_has_no_prices():
+    assert benchmark.weighted_portfolio_series({"069500": {"2026-11-09": 100}}, WEIGHTS) == {}
+    assert benchmark.weighted_portfolio_series(_closes([0, 1, 1], [1, 1, 1]), WEIGHTS) == {}
+
+
+def test_allocation_comparison_leaves_only_what_the_account_adds():
+    """Both ETFs +10%: the target is +9.4%. An account that made +8% is 1.4p
+    behind its own allocation, whatever KOSPI did."""
+
+    account = [_point("2026-11-09", 1_000_000), _point("2026-11-10", 1_080_000)]
+
+    out = benchmark.build_allocation_comparison(
+        account, _closes([100, 110, 110], [200, 220, 220]), WEIGHTS,
+        names={"069500": "KODEX 200", "133690": "TIGER 미국나스닥100"},
+        source="test",
+    )
+
+    assert out["available"] is True
+    assert out["account_return_pct"] == 8.0
+    assert out["index_return_pct"] == 9.4
+    assert out["alpha_pct"] == -1.4
+    assert out["label"] == (
+        "목표 배분 (KODEX 200 47% + TIGER 미국나스닥100 47% + 현금 6%, 매일 리밸런스 가정)"
+    )
+    assert out["weights"] == WEIGHTS and out["source"] == "test"
+
+
+def test_allocation_comparison_has_no_cash_split():
+    """The target already holds cash; scaling it by the account's exposure
+    again would count that cash twice."""
+
+    account = [
+        _point_cash("2026-11-09", 1_000_000, 500_000),
+        _point_cash("2026-11-10", 1_050_000, 500_000),
+    ]
+
+    out = benchmark.build_allocation_comparison(
+        account, _closes([100, 110, 110], [200, 220, 220]), WEIGHTS
+    )
+
+    assert "cash_drag_pct" not in out and "avg_exposure_pct" not in out
+
+
+def test_allocation_comparison_without_prices_is_unavailable():
+    out = benchmark.build_allocation_comparison(
+        [_point("2026-11-09", 1_000_000), _point("2026-11-10", 1_010_000)], {}, WEIGHTS
+    )
+
+    assert out["available"] is False
+    assert "label" in out  # still says what it would have compared against
+
+
+def test_index_comparison_is_unchanged_by_the_shared_core():
+    """`build_comparison` now delegates to `compare_series`; same numbers."""
+
+    days = [f"2026-09-{d:02d}" for d in range(1, 8)]
+    account = [_point_cash(d, 1_000_000 + 1_000 * i, 400_000) for i, d in enumerate(days)]
+    bars = [_bar(d.replace("-", ""), 100 + i) for i, d in enumerate(days)]
+
+    via_bars = benchmark.build_comparison(account, bars, trailing_windows=(3,))
+    via_series = benchmark.compare_series(
+        account, benchmark.index_series(bars), trailing_windows=(3,)
+    )
+
+    assert via_bars == via_series
+    assert "cash_drag_pct" in via_bars

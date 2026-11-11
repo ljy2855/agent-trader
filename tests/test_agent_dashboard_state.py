@@ -233,3 +233,60 @@ def test_past_the_supported_calendar_there_is_no_next_open():
 
     assert next_regular_session_open(_at("2026-12-31 16:00")) is None
     assert market_session_overview(_at("2026-12-31 16:00"))["next_open"] is None
+
+
+# -- market context on the overview ------------------------------------------
+
+
+def test_overview_carries_market_context_and_hands_it_the_kiwoom_client(monkeypatch):
+    """Agents read one URL. The reference market data rides on it, and the
+    route's Kiwoom client reaches the one leg that needs it (ETF NAV)."""
+
+    import asyncio
+
+    from src import agent_overview
+
+    seen = {}
+
+    async def watcher():
+        return {"status": "ok"}
+
+    async def autopilot():
+        return {"status": "ok"}
+
+    async def context(client):
+        seen["client"] = client
+        return {"vix": {"value": 19.46}}
+
+    monkeypatch.setattr(agent_overview, "fetch_watcher_status", watcher)
+    monkeypatch.setattr(agent_overview, "fetch_autopilot_status", autopilot)
+    monkeypatch.setattr(agent_overview.market_context, "build_market_context", context)
+    client = object()
+
+    payload = asyncio.run(agent_overview.build_agent_overview(client))
+
+    assert payload["market_context"] == {"vix": {"value": 19.46}}
+    assert seen["client"] is client
+    assert payload["watcher"] == {"status": "ok"}
+
+
+def test_overview_survives_a_market_context_crash(monkeypatch):
+    import asyncio
+
+    from src import agent_overview
+
+    async def ok():
+        return {"status": "ok"}
+
+    async def boom(client):
+        raise RuntimeError("feed exploded")
+
+    monkeypatch.setattr(agent_overview, "fetch_watcher_status", ok)
+    monkeypatch.setattr(agent_overview, "fetch_autopilot_status", ok)
+    monkeypatch.setattr(agent_overview.market_context, "build_market_context", boom)
+
+    payload = asyncio.run(agent_overview.build_agent_overview())
+
+    assert payload["market_context"]["status"] == "error"
+    assert "feed exploded" in payload["market_context"]["error"]
+    assert payload["watcher"] == {"status": "ok"}

@@ -4035,7 +4035,14 @@ class IntradayWatcher:
         regime = self._prev_regime or planner_result.get("regime") or {}
         if not regime or not regime.get("market_data_complete", True):
             raise ValueError("현재 시장 레짐 확인 불가")
-        if regime.get("extreme_risk_off"):
+        # The crash veto belongs to the stock strategies: it keeps a dip-buyer
+        # out of a falling market. The index allocation is the opposite kind
+        # of rule — it rebalances toward target whatever the day looks like,
+        # and the replay it was sized on (2026-10-10) had no such gate. With
+        # the veto on, a sell-off in days 1–7 would cancel exactly the buy
+        # the allocation exists to make. Missing market data still blocks
+        # (checked just above): that is "cannot see", not "market is down".
+        if regime.get("extreme_risk_off") and self._config.entry_mode != etf_allocation.MODE:
             raise ValueError("극단적 시장 약세 — 신규 진입 불가")
         quote = detail.get("quote") or {}
         price = to_price(quote.get("cur_prc"))
