@@ -1272,11 +1272,32 @@ class IntradayWatcher:
         # -4/+8 here would silently replace it with an untested trading rule.
         return [h for h in holdings if order_ledger.normalize_stock_code(h.get("stock_code")) not in etf_allocation.TARGETS]
 
+    def _codes_with_unresolved_intents(self) -> set[str]:
+        """Normalized codes with an order of ours the broker may still hold."""
+
+        if self._ledger is None:
+            return set()
+        try:
+            return {
+                order_ledger.normalize_stock_code(i.stock_code)
+                for i in self._ledger.unresolved()
+            }
+        except OrderLedgerError:
+            # Skip nothing; the order paths fail closed on a broken ledger.
+            return set()
+
     def _allocation_events(self, result: dict) -> list[TriggerEvent]:
         allocation = result.get("allocation") or {}
+        # A code whose order is already working is not re-proposed: until the
+        # 15:30 auction fills it the account still shows the old position, so
+        # the plan asks again every tick (sell) or cooldown (buy). Each repeat
+        # only re-ran the gates and re-queried the account (11/10: 16 sells).
+        working = self._codes_with_unresolved_intents()
         events = []
         for side in ("sells", "buys"):
             for row in allocation.get(side, []):
+                if order_ledger.normalize_stock_code(row["stock_code"]) in working:
+                    continue
                 events.append(TriggerEvent(
                     trigger_type="etf_allocation_sell" if side == "sells" else "etf_allocation_buy",
                     tier=1 if side == "sells" else 2, scope="stock", target_role=ROLE_SELF,
@@ -1830,11 +1851,36 @@ class IntradayWatcher:
             rows, stock_code, include_unclassified=True
         )
         if working > 0:
-            return (
-                f"브로커에 미체결 매수 {working}주 잔존 (원장 기록 없음 — "
-                "수동/외부 주문 가능) — 중복 매수 차단"
-            )
+            # Only shares no intent of ours explains are "external". A buy we
+            # placed and still track is working at the broker too; calling it
+            # a possible manual order (and alerting on it) was wrong. In ETF
+            # mode the plan re-proposes the same buy every cooldown until the
+            # 15:30 auction fills it, so it fired on 11/10 and 11/11. Our own
+            # pending intent is refused right after this, by the ledger check.
+            ours = self._own_working_buy_quantity(stock_code)
+            external = working - ours
+            if external > 0:
+                return (
+                    f"브로커에 미체결 매수 {working}주 잔존 (원장 기록 {ours}주 — "
+                    f"나머지 {external}주는 수동/외부 주문 가능) — 중복 매수 차단"
+                )
         return None
+
+    def _own_working_buy_quantity(self, stock_code: str) -> int:
+        """Shares our unresolved buy intents for this stock may still have working."""
+
+        if self._ledger is None:
+            return 0
+        code = order_ledger.normalize_stock_code(stock_code)
+        try:
+            pending = self._ledger.unresolved(side=order_ledger.SIDE_BUY)
+        except OrderLedgerError:
+            return 0  # count nothing as ours: the external branch then blocks
+        return sum(
+            i.remaining_quantity
+            for i in pending
+            if order_ledger.normalize_stock_code(i.stock_code) == code
+        )
 
     def _ledger_snapshot(
         self, *, recent_limit: int = 20, audit_limit: int = 50
@@ -3550,10 +3596,16 @@ class IntradayWatcher:
                 )
                 return OrderApplyResult.skipped(action, blocked)
 
-            if ledger.has_unresolved(code, order_ledger.SIDE_BUY):
-                pending = ledger.unresolved(
-                    stock_code=code, side=order_ledger.SIDE_BUY
-                )
+            # Compare normalized codes: intents keep the code as it was given
+            # (bare or A-prefixed), and the broker gate above now leaves our
+            # own working orders to this check, so an exact-match miss here
+            # would let a duplicate through.
+            normalized = order_ledger.normalize_stock_code(code)
+            pending = [
+                i for i in ledger.unresolved(side=order_ledger.SIDE_BUY)
+                if order_ledger.normalize_stock_code(i.stock_code) == normalized
+            ]
+            if pending:
                 states = ", ".join(sorted({i.state for i in pending}))
                 log.warning(
                     "candidate buy blocked: %d unresolved buy intent(s) for %s (%s)",

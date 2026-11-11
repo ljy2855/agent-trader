@@ -3739,6 +3739,97 @@ def test_broker_only_open_buy_blocks_a_new_buy(monkeypatch):
     assert ledger.unresolved() == []
 
 
+def _own_working_buy(ledger, code="123456", quantity=10, order_no="8001"):
+    intent = _seed_intent(ledger, stock_code=code, side="buy", quantity=quantity, price=10000)
+    ledger.mark_state(intent.intent_id, STATE_SUBMITTED, order_no=order_no)
+    return intent
+
+
+def test_own_working_buy_is_refused_by_the_ledger_not_called_external(monkeypatch):
+    """11/10·11/11: our own close-auction buy, still working, was reported as a
+    possible manual order and alerted on. It is ours; the ledger refuses it."""
+
+    async def fake_buy(client, **kwargs):
+        raise AssertionError("our own buy is still working — must not duplicate")
+
+    monkeypatch.setattr(watcher_module.order_service, "place_stock_buy_order", fake_buy)
+    w, ledger = _ledger_watcher()
+    _own_working_buy(ledger)
+
+    async def fake_open_orders():
+        return [_buy_row(code="123456")]  # ord_no 8001, 10 still working
+
+    monkeypatch.setattr(w, "_fetch_open_orders", fake_open_orders)
+
+    result = asyncio.run(
+        w._apply_action(
+            _candidate_event("123456"), "TIER1",
+            {"portfolio": {"position_budget": 100_000, "max_positions": 3}},
+        )
+    )
+
+    assert result.state == "skipped"
+    assert result.attempted is False
+    assert "미종결 매수 intent" in (result.reason or "")
+    assert "외부" not in (result.reason or "")
+    assert not any(c[0] == "error" and "매수 차단" in c[1] for c in w._notifier.calls)
+
+
+def test_working_shares_beyond_our_intents_are_still_external(monkeypatch):
+    async def fake_buy(client, **kwargs):
+        raise AssertionError("unexplained working shares — must not duplicate")
+
+    monkeypatch.setattr(watcher_module.order_service, "place_stock_buy_order", fake_buy)
+    w, ledger = _ledger_watcher()
+    _own_working_buy(ledger, quantity=4, order_no="8001")
+
+    async def fake_open_orders():
+        return [
+            _buy_row(code="123456", qty="4", remaining="4"),  # ours (8001)
+            {**_buy_row(code="123456", qty="6", remaining="6"), "ord_no": "9001"},
+        ]
+
+    monkeypatch.setattr(w, "_fetch_open_orders", fake_open_orders)
+
+    result = asyncio.run(
+        w._apply_action(
+            _candidate_event("123456"), "TIER1",
+            {"portfolio": {"position_budget": 100_000, "max_positions": 3}},
+        )
+    )
+
+    assert result.state == "skipped"
+    assert "외부" in (result.reason or "")
+    assert any(c[0] == "error" and "매수 차단" in c[1] for c in w._notifier.calls)
+
+
+def test_pending_buy_blocks_a_duplicate_across_code_spellings(monkeypatch):
+    """The broker gate now leaves our own orders to the ledger check, so that
+    check must not miss an intent stored as A123456 when asked for 123456."""
+
+    async def fake_buy(client, **kwargs):
+        raise AssertionError("pending intent under the A-prefixed spelling — must not duplicate")
+
+    monkeypatch.setattr(watcher_module.order_service, "place_stock_buy_order", fake_buy)
+    w, ledger = _ledger_watcher()
+    _own_working_buy(ledger, code="A123456")
+
+    async def fake_open_orders():
+        return [_buy_row(code="123456")]
+
+    monkeypatch.setattr(w, "_fetch_open_orders", fake_open_orders)
+
+    result = asyncio.run(
+        w._apply_action(
+            _candidate_event("123456"), "TIER1",
+            {"portfolio": {"position_budget": 100_000, "max_positions": 3}},
+        )
+    )
+
+    assert result.state == "skipped"
+    assert "미종결 매수 intent" in (result.reason or "")
+
+
 def test_fully_filled_broker_buy_row_does_not_block(monkeypatch):
     """Nothing remaining means nothing working."""
 
@@ -6840,6 +6931,31 @@ def _etf_plan():
 def test_etf_profile_refuses_incompatible_execution_configuration():
     with pytest.raises(ValueError, match="etf_allocation requires"):
         _build_watcher(config=_config(entry_mode="etf_allocation"))
+
+
+def test_etf_plan_does_not_repropose_a_code_whose_order_is_working():
+    """11/10: the migration sell was re-proposed 16 times while it waited for
+    the 15:30 auction, and the buy again after its cooldown."""
+
+    w = _etf_watcher()
+    _seed_intent(w._ledger, stock_code="316140", side="sell", quantity=10, price=None,
+                 origin="etf_allocation_sell")
+    _seed_intent(w._ledger, stock_code="069500", side="buy", quantity=5, price=83_000,
+                 origin="etf_allocation_buy")
+    allocation = {
+        "sells": [{"stock_code": "316140", "stock_name": "우리금융지주", "quantity": 10,
+                   "current_price": 31_000, "reason": "ETF 배분으로 전환"}],
+        "buys": [
+            {"stock_code": "069500", "stock_name": "KODEX 200", "quantity": 6,
+             "current_price": 82_000, "reason": "초기 ETF 배분"},
+            {"stock_code": "133690", "stock_name": "TIGER 미국나스닥100", "quantity": 3,
+             "current_price": 166_000, "reason": "초기 ETF 배분"},
+        ],
+    }
+
+    events = w._allocation_events({"allocation": allocation})
+
+    assert [(e.trigger_type, e.stock_code) for e in events] == [("etf_allocation_buy", "133690")]
 
 
 def test_etf_hard_exits_apply_to_legacy_positions_only():
