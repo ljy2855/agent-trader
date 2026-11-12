@@ -180,3 +180,196 @@ def test_auth_expiry_verdict_is_shared_and_narrow():
     assert client_module.is_auth_expiry_code(8005, "") is True
     assert client_module.is_auth_expiry_code(805004, "[CODE=8001, MESSAGE=x]") is False
     assert client_module.is_auth_expiry_code(0, "정상처리") is False
+
+
+# -- once-a-second account queries ---------------------------------------------
+
+
+class _Clock:
+    """Time that moves only when the client sleeps, so spacing is exact."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.slept: list[float] = []
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, seconds: float) -> None:
+        self.slept.append(round(seconds, 3))
+        self.now += seconds
+
+
+class _OncePerSecond:
+    """Kiwoom's gate as its 2026-11-09 notice states it: each listed query
+    once a second, refused with 429 (the status its rate limit has always
+    answered with) when asked again sooner."""
+
+    def __init__(self, clock: _Clock, *, others_sent_at: dict[str, float] | None = None) -> None:
+        self.clock = clock
+        self.last = dict(others_sent_at or {})  # sends by another process on the key
+        self.seen: list[tuple[str, float, int]] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        api_id = request.headers["api-id"]
+        limited = api_id in client_module.ONE_PER_SECOND_API_IDS
+        last = self.last.get(api_id)
+        refused = limited and last is not None and self.clock() - last < 1.0
+        self.last[api_id] = self.clock()
+        self.seen.append((api_id, round(self.clock() - 1000.0, 3), 429 if refused else 200))
+        if refused:
+            return httpx.Response(429, text="Too Many Requests")
+        return httpx.Response(200, json={"return_code": 0, "return_msg": "정상적으로 처리되었습니다"})
+
+
+@pytest.fixture
+def paced(monkeypatch):
+    """A real client in front of the once-a-second gate, on a clock we hold."""
+
+    monkeypatch.setenv("KIWOOM_USE_MOCK", "true")
+    monkeypatch.setenv("KIWOOM_MOCK_APPKEY", "mock-appkey")
+    monkeypatch.setenv("KIWOOM_MOCK_SECRETKEY", "mock-secret")
+    clock = _Clock()
+    monkeypatch.setattr(client_module, "_clock", clock)
+    monkeypatch.setattr(client_module, "_sleep", clock.sleep)
+
+    def build(**gate_kwargs):
+        gate = _OncePerSecond(clock, **gate_kwargs)
+        settings = Settings(_env_file=None)
+        http_client = httpx.AsyncClient(
+            base_url=settings.active_base_url, transport=httpx.MockTransport(gate)
+        )
+        token_manager = FakeTokenManager()
+        token_manager.current_token = "fresh-token"
+        return KiwoomClient(settings, token_manager=token_manager, http_client=http_client), gate, clock
+
+    return build
+
+
+def _ask(client, api_id: str):
+    return client.post("/api/dostk/acnt", headers={"api-id": api_id, "cont-yn": "N"}, json={})
+
+
+def test_the_buy_gates_account_read_waits_out_the_planners(paced):
+    """One tick reads the account twice: the planner first, the buy gate a
+    few hundred milliseconds later. Since 2026-11-12 18:00 Kiwoom refuses the
+    second, and a refused account read blocks the buy."""
+
+    client, gate, clock = paced()
+
+    async def tick():
+        await _ask(client, "kt00004")  # planner
+        clock.now += 0.4               # the market snapshot in between
+        await _ask(client, "kt00004")  # buy gate, first ETF
+        await _ask(client, "kt00004")  # buy gate, second ETF
+
+    asyncio.run(tick())
+
+    assert [status for _, _, status in gate.seen] == [200, 200, 200]
+    assert [at for _, at, _ in gate.seen] == [0.0, 1.2, 2.4]
+    assert clock.slept == [0.8, 1.2]
+
+
+def test_without_the_spacing_the_gate_refuses_the_second_read(paced, monkeypatch):
+    """What the fixture's gate does to the old behaviour — the reason the
+    spacing exists."""
+
+    monkeypatch.setattr(client_module, "ACCOUNT_QUERY_SPACING_SECONDS", 0.0)
+    client, gate, _ = paced()
+
+    async def tick():
+        await _ask(client, "kt00004")
+        await _ask(client, "kt00004")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(tick())
+    assert [status for _, _, status in gate.seen] == [200, 429, 429]
+
+
+def test_other_queries_are_not_held_back(paced):
+    """The limit is per query: the unfilled-orders read that follows the
+    account read in every tick is a different one, and not on the list."""
+
+    client, gate, clock = paced()
+
+    async def tick():
+        await _ask(client, "kt00004")
+        await _ask(client, "ka10075")
+        await _ask(client, "ka10075")
+        await _ask(client, "kt00017")
+
+    asyncio.run(tick())
+
+    assert clock.slept == []
+    assert [status for _, _, status in gate.seen] == [200, 200, 200, 200]
+
+
+def test_queries_that_arrive_together_leave_one_spacing_apart(paced):
+    """Two dashboard loads at once ask for the same query in the same instant."""
+
+    client, gate, _ = paced()
+
+    async def together():
+        await asyncio.gather(*(_ask(client, "kt00015") for _ in range(3)))
+
+    asyncio.run(together())
+
+    assert [(at, status) for _, at, status in gate.seen] == [(0.0, 200), (1.2, 200), (2.4, 200)]
+
+
+def test_a_refusal_caused_by_another_process_is_asked_again_once(paced):
+    """The watcher and the dashboard run as separate processes on one app
+    key. When the other one sent the same query a moment ago, ours is
+    refused however well it paces itself; it asks again a spacing later."""
+
+    client, gate, clock = paced(others_sent_at={"kt00004": 999.7})
+
+    asyncio.run(_ask(client, "kt00004"))
+
+    assert [(at, status) for _, at, status in gate.seen] == [(0.0, 429), (1.2, 200)]
+    assert clock.slept == [1.2]
+
+
+def test_a_query_refused_twice_is_reported_not_repeated_forever(paced):
+    client, _, clock = paced()
+
+    def always_refused(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers["api-id"])
+        return httpx.Response(429, text="Too Many Requests")
+
+    calls: list[str] = []
+    client._client = httpx.AsyncClient(
+        base_url="https://example.invalid", transport=httpx.MockTransport(always_refused)
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(_ask(client, "kt00004"))
+    assert calls == ["kt00004", "kt00004"]
+
+
+def test_a_refused_query_off_the_list_is_left_to_its_caller(paced):
+    """Market queries have their own three-attempt retry; an order must never
+    be sent twice from here."""
+
+    client, _, clock = paced()
+    calls: list[str] = []
+
+    def always_refused(request: httpx.Request) -> httpx.Response:
+        calls.append(request.headers["api-id"])
+        return httpx.Response(429, text="Too Many Requests")
+
+    client._client = httpx.AsyncClient(
+        base_url="https://example.invalid", transport=httpx.MockTransport(always_refused)
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(_ask(client, "kt10000"))
+    assert calls == ["kt10000"] and clock.slept == []
+
+
+def test_the_listed_queries_are_the_nineteen_of_the_notice():
+    assert len(client_module.ONE_PER_SECOND_API_IDS) == 19
+    # The two the watcher's order path depends on: the account read is
+    # limited, the unfilled-orders read beside it is not.
+    assert "kt00004" in client_module.ONE_PER_SECOND_API_IDS
+    assert "ka10075" not in client_module.ONE_PER_SECOND_API_IDS

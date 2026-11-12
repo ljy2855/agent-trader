@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
+import time
 import uuid
 from typing import Any
 
@@ -110,6 +112,47 @@ def _response_has_invalid_token(response: httpx.Response) -> bool:
     except ValueError:
         return False
     return _is_token_invalid_payload(payload)
+
+
+# Kiwoom lets each of these account queries through once a second, down from
+# five (its notice of 2026-11-09, in force from 2026-11-12 18:00). Nothing here
+# repeats one that fast on purpose, but two paths did it by accident: the
+# planner reads the account (kt00004) at the top of a tick and the buy gate
+# reads it again before each order, a few hundred milliseconds later; and a
+# query that pages asks for its next page at once. A refused account read
+# fails closed, so under the new limit the gate would have refused every buy
+# of the tick, and of the next tick, for as long as the order was due.
+ONE_PER_SECOND_API_IDS = frozenset({
+    "kt00001", "kt00002", "kt00003", "kt00004", "kt00005", "kt00007", "kt00008",
+    "kt00009", "kt00013", "kt00015", "kt00016", "kt00017", "kt00018",
+    "kt50020", "kt50021", "kt50030", "kt50031", "kt50032", "kt50075",
+})
+
+# A little over the second, so that two sends this far apart cannot both
+# land inside one of Kiwoom's.
+ACCOUNT_QUERY_SPACING_SECONDS = 1.2
+
+# Shared by every client in the process — the dashboard and the MCP tools
+# hold one each and spend the same app key. Another process on that key
+# (the watcher beside the dashboard) is beyond its reach; the single retry
+# in `post` is for that.
+_next_send: dict[str, float] = {}
+_clock = time.monotonic
+_sleep = asyncio.sleep
+
+
+def _hold_before_sending(api_id: str) -> float:
+    """Seconds to wait so that sends of ``api_id`` stay a spacing apart.
+
+    The slot is taken before any waiting, with nothing awaited in between,
+    so callers that arrive together queue up one spacing apart instead of
+    all waking at the same moment.
+    """
+
+    now = _clock()
+    slot = max(now, _next_send.get(api_id, 0.0))
+    _next_send[api_id] = slot + ACCOUNT_QUERY_SPACING_SECONDS
+    return slot - now
 
 
 class KiwoomClient:
@@ -265,16 +308,35 @@ class KiwoomClient:
         json: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
     ) -> httpx.Response:
-        """Perform a POST request against the Kiwoom OpenAPI with automatic authentication."""
+        """Perform a POST request against the Kiwoom OpenAPI with automatic authentication.
 
-        return await self._request_with_auth_retry(
-            "POST",
-            path,
-            headers=headers,
-            params=params,
-            json=json,
-            data=data,
-        )
+        The once-a-second account queries are spaced out here, and a 429 on
+        one of them is asked again once, a spacing later: they are reads, so
+        asking twice changes nothing, and the refusal usually means another
+        process on the same app key sent the same query in the same second.
+        Orders are not among them and are never repeated here.
+        """
+
+        api_id = (headers or {}).get("api-id")
+        paced = api_id in ONE_PER_SECOND_API_IDS
+        for attempt in range(2 if paced else 1):
+            if paced:
+                hold = _hold_before_sending(api_id)
+                if hold > 0:
+                    await _sleep(hold)
+            try:
+                return await self._request_with_auth_retry(
+                    "POST",
+                    path,
+                    headers=headers,
+                    params=params,
+                    json=json,
+                    data=data,
+                )
+            except httpx.HTTPStatusError as error:
+                if not paced or attempt == 1 or error.response.status_code != 429:
+                    raise
+        raise AssertionError("unreachable")  # the loop returns or raises
 
 
-__all__ = ["KiwoomClient"]
+__all__ = ["ACCOUNT_QUERY_SPACING_SECONDS", "ONE_PER_SECOND_API_IDS", "KiwoomClient"]

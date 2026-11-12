@@ -17,7 +17,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.services import market_context  # noqa: E402
+from src.services import kiwoom_client, market_context  # noqa: E402
 
 
 def _refuse(request: httpx.Request) -> httpx.Response:
@@ -34,3 +34,13 @@ def _offline_market_context(monkeypatch):
     )
     yield
     market_context.clear_cache()
+
+
+@pytest.fixture(autouse=True)
+def _fresh_account_query_pacing():
+    """The spacing between account queries is kept per process. Left over
+    from one test it would make the next one's first query wait."""
+
+    kiwoom_client._next_send.clear()
+    yield
+    kiwoom_client._next_send.clear()
