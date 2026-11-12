@@ -3,6 +3,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 import asyncio
 import math
+import httpx
 import pytest
 
 from src.services.etf_allocation import allocation_orders, plan_etf_allocation, verified_assets
@@ -163,6 +164,55 @@ def test_the_watcher_failure_detail_names_the_etf_plans_failed_read(monkeypatch)
     assert _describe_degraded_sources(result) == (
         "planner degraded — unexecuted_orders: pagination incomplete"
     )
+
+
+class _Kiwoom:
+    """A client whose every request ends the way `outcome` says: an httpx
+    error raised, or a body answered. The reads under test are the real ones,
+    so the failure reaches the planner in the shape production gives it."""
+
+    def __init__(self, outcome):
+        self.outcome = outcome
+
+    async def post(self, *args, **kwargs):
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return httpx.Response(200, json=self.outcome)
+
+
+@pytest.mark.parametrize("outcome, named", [
+    (httpx.ReadTimeout(""), "ReadTimeout"),  # httpx timeouts stringify to ""
+    (httpx.RemoteProtocolError("Server disconnected without sending a response."), "Server disconnected"),
+    ({"return_code": 3, "return_msg": "인증에 실패했습니다[8001:App Key와 Secret Key 검증에 실패했습니다]"},
+     "인증에 실패했습니다[8001"),
+])
+def test_a_failed_account_read_says_why(outcome, named):
+    """Three single ticks stopped here on 2026-11-12 with "계좌 조회 불완전" and
+    nothing else: the log could not tell a timeout from a dropped connection
+    from a broker error, because the read's own reason was left behind."""
+
+    with pytest.raises(ValueError, match="계좌 조회 불완전 — ") as raised:
+        asyncio.run(plan_etf_allocation(_Kiwoom(outcome), None))
+
+    assert named in str(raised.value)
+
+
+def test_a_failed_etf_quote_names_the_etf_and_the_reason(monkeypatch):
+    from src.services import market
+
+    stub_plan_sources(monkeypatch, holdings=[])
+
+    async def snapshot(client, **kwargs):
+        # The second ETF's quote, orderbook and daily bars all time out.
+        failed = await market.get_stock_detail_bundle(_Kiwoom(httpx.ReadTimeout("")), stock_code="133690")
+        return {"success": False, "indices": {}, "watchlist_details": [
+            {"stock_code": "069500", "success": True, "quote": {"cur_prc": "100000"}}, failed,
+        ]}
+
+    monkeypatch.setattr(market, "get_market_snapshot", snapshot)
+
+    with pytest.raises(ValueError, match=r"ETF 시세 조회 불완전\(133690\) — ReadTimeout"):
+        asyncio.run(plan_etf_allocation(None, None))
 
 
 @pytest.mark.parametrize("holdings", [

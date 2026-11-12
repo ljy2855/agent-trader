@@ -86,6 +86,23 @@ YAHOO_069500 = {"chart": {"result": [{"meta": {
                    "adjclose": [{"adjclose": [84610.0, 79005.0, 78490.0, 82000.0, 84540.0]}]}}],
     "error": None}}
 
+# ^VIX daily bars from a capture on 2026-11-12 20:04 KST, cut back to how they
+# stood at that morning's 08:40 brief: the 11/11 session closed at 17.49, and
+# the 11/12 bar (18.27 by the evening) not yet begun. `regularMarketTime` is
+# set to that close, 16:15 New York; the capture's own was the evening's.
+# Cboe's file still ended at 11/10 then, which is CBOE_CSV below.
+YAHOO_VIX = {"chart": {"result": [{"meta": {
+    "currency": "USD", "symbol": "^VIX", "exchangeName": "CXI", "instrumentType": "INDEX",
+    "regularMarketTime": 1794431700, "gmtoffset": -21600, "timezone": "CST",
+    "exchangeTimezoneName": "America/Chicago", "regularMarketPrice": 17.49,
+    "chartPreviousClose": 25.64, "dataGranularity": "1d", "range": "5d"},
+    "timestamp": [1793952000, 1794211200, 1794297600, 1794384000],
+    "indicators": {"quote": [{"close": [25.639999389648438, 19.920000076293945,
+                                        19.459999084472656, 17.489999771118164],
+                              "open": [27.68000030517578, 25.079999923706055,
+                                       19.760000228881836, 18.809999465942383]}]}}],
+    "error": None}}
+
 CBOE_CSV = (
     "DATE,OPEN,HIGH,LOW,CLOSE\n"
     "01/02/1990,17.240000,17.240000,17.240000,17.240000\n"
@@ -122,6 +139,22 @@ KA40003_069500 = {"return_code": 0, "return_msg": "정상적으로 처리되었�
      "navidex_dispty_rt": "+1.01", "navetfdispty_rt": "-0.16", "trace_eor_rt": "69",
      "trace_cur_prc": "+83832", "trace_pred_pre": "+2401", "trace_pre_sig": "2"},
 ]}
+
+
+def _before_the_open(payload: dict, nav: str) -> dict:
+    """ka40003 as the 2026-11-12 08:40 brief met it: a row for today on top,
+    priced at the last close, with no NAV and a premium of zero.
+
+    The raw row was not captured — what is known is what the brief was
+    handed (date 11/12, NAV 0, premium 0, price unchanged) — so `nav` is
+    tried in each form an empty figure could take.
+    """
+
+    last = payload["etfdaly_trnsn"][0]
+    today = {**last, "cntr_dt": "20261112", "cur_prc": last["cur_prc"].lstrip("+-"),
+             "pre_sig": "3", "pred_pre": "0", "pre_rt": "0.00", "trde_qty": "0",
+             "nav": nav, "acc_trde_prica": "0", "navetfdispty_rt": "0.00"}
+    return {**payload, "etfdaly_trnsn": [today, last]}
 
 
 # -- parsers -----------------------------------------------------------------
@@ -245,6 +278,25 @@ def test_etf_nav_is_a_magnitude_and_the_premium_keeps_its_sign():
     assert mc.parse_etf_daily_trend(KA40003_069500)["premium_pct"] == -0.16
 
 
+@pytest.mark.parametrize("nav", ["0", "0.00", ""])
+def test_before_the_open_the_etf_answer_is_the_last_published_nav(nav):
+    """Today's row has no NAV until the session produces one. Reading it gave
+    the brief "NAV 0, premium 0%" — a figure that looks like fair value."""
+
+    etf = mc.parse_etf_daily_trend(_before_the_open(KA40003_133690, nav))
+
+    assert etf["date"] == "2026-11-11"
+    assert etf["nav"] == 163667.77 and etf["premium_pct"] == 1.36
+
+
+def test_an_etf_answer_with_no_nav_anywhere_raises():
+    payload = _before_the_open(KA40003_133690, "0")
+    payload["etfdaly_trnsn"] = payload["etfdaly_trnsn"][:1]
+
+    with pytest.raises(ValueError, match="NAV"):
+        mc.parse_etf_daily_trend(payload)
+
+
 def test_etf_business_error_raises():
     with pytest.raises(ValueError, match="ka40003"):
         mc.parse_etf_daily_trend({"return_code": 3, "return_msg": "인증에 실패했습니다"})
@@ -278,6 +330,8 @@ def _transport(*, yahoo_ok: bool = True, counter: dict | None = None) -> httpx.M
                 return httpx.Response(429, text="Too Many Requests")
             if request.url.params.get("interval") == "60m":
                 return httpx.Response(200, json=YAHOO_NQ_HOURLY)
+            if "VIX" in request.url.path:
+                return httpx.Response(200, json=YAHOO_VIX)
             return httpx.Response(200, json=YAHOO_069500 if ".KS" in request.url.path else YAHOO_NQ)
         if host == "cdn.cboe.com":
             return httpx.Response(200, text=CBOE_CSV)
@@ -309,7 +363,13 @@ def test_context_carries_every_leg_with_its_source():
     assert futures["source"].startswith("Yahoo NQ=F")
     # An index says which close its change is measured from.
     assert ctx["us"]["nasdaq100"]["prev_close_date"] == "2026-11-10"
-    assert ctx["vix"]["value"] == 19.46 and "Cboe" in ctx["vix"]["source"]
+    # At brief time Cboe's file ends a day early; Yahoo has the close.
+    assert ctx["vix"]["reference"]["value"] == 19.46 and ctx["vix"]["reference"]["date"] == "2026-11-10"
+    assert "Cboe" in ctx["vix"]["reference"]["source"]
+    assert ctx["vix"]["market"] == {
+        "value": 17.49, "prev_close": 19.46, "prev_close_date": "2026-11-10", "change_pct": -10.12,
+        "date": "2026-11-11", "as_of": "2026-11-12T06:15+09:00", "source": "Yahoo ^VIX (비공식)",
+    }
     assert ctx["usd_krw"]["reference"]["value"] == 1343.3
     assert ctx["etf"]["133690"] == {
         "name": "TIGER 미국나스닥100", "date": "2026-11-11", "close": 165925.0,
@@ -326,7 +386,8 @@ def test_one_source_failing_leaves_the_others_standing():
     assert "error" in ctx["us"]["nasdaq100_futures"]
     assert "error" in ctx["usd_krw"]["market"]
     assert "error" in ctx["etf"]["069500"] and ctx["etf"]["069500"]["name"] == "KODEX 200"
-    assert ctx["vix"]["value"] == 19.46  # Cboe still answered
+    assert "error" in ctx["vix"]["market"]  # Yahoo's VIX went with Yahoo
+    assert ctx["vix"]["reference"]["value"] == 19.46  # Cboe still answered
     assert ctx["usd_krw"]["reference"]["value"] == 1343.3  # so did ECOS
 
 
@@ -334,7 +395,7 @@ def test_without_a_kiwoom_client_the_etf_leg_says_so_and_nothing_else_breaks():
     ctx = _build(None)
 
     assert "error" in ctx["etf"]
-    assert ctx["vix"]["value"] == 19.46
+    assert ctx["vix"]["reference"]["value"] == 19.46
 
 
 def test_a_second_request_is_served_from_cache_including_kiwoom():
@@ -381,7 +442,7 @@ def test_a_source_that_hangs_is_remembered_as_failed(monkeypatch):
     assert "TimeoutError" in first["etf"]["069500"]["error"]
     assert "TimeoutError" in second["etf"]["133690"]["error"]
     assert len(kiwoom.calls) == 2  # one per ETF, and not asked again
-    assert first["vix"]["value"] == 19.46  # the rest still rendered
+    assert first["vix"]["reference"]["value"] == 19.46  # the rest still rendered
 
 
 def test_daily_closes_return_every_symbol_or_raise():
@@ -405,4 +466,5 @@ def test_the_suite_default_refuses_the_network():
 
     ctx = asyncio.run(mc.build_market_context(None))
 
-    assert "error" in ctx["vix"] and "ConnectError" in ctx["vix"]["error"]
+    for leg in ("market", "reference"):
+        assert "ConnectError" in ctx["vix"][leg]["error"]

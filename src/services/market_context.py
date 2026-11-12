@@ -62,6 +62,12 @@ US_FUTURES_SYMBOLS = {
     "sp500_futures": "ES=F",
 }
 USD_KRW_SYMBOL = "KRW=X"
+# Cboe posts its official close hours after the session: the file for
+# 2026-11-11 is stamped 21:11 New York time, 11:11 in Korea. The 08:40 brief
+# therefore read the close of the day before from it. Yahoo carries the same
+# closes (17.49, 19.46 and 19.92 matched to the cent) as soon as the session
+# ends, so it is shown beside the official figure.
+VIX_SYMBOL = "^VIX"
 
 # The US cash session ends at 16:00 New York time.
 US_CASH_CLOSE_HOUR = 16
@@ -399,12 +405,17 @@ def _signed(raw: Any) -> float | None:
 
 
 def parse_etf_daily_trend(payload: dict[str, Any]) -> dict[str, Any]:
-    """Latest row of ka40003: close, NAV and the premium over NAV.
+    """Latest row of ka40003 that has a NAV: close, NAV and the premium.
 
     Prices carry Kiwoom's direction sign (``"-163667.77"`` is a NAV on a
     down day), so they are read as magnitudes. ``navetfdispty_rt`` is the
     one signed number that means what its sign says: the market price
     against NAV, in percent.
+
+    Before the open the first row is already today's, with no NAV in it yet:
+    the 2026-11-12 08:40 brief was handed a NAV of 0 and a premium of 0%
+    for both ETFs. A row without a NAV is passed over, so the answer is the
+    last published one under its own date.
     """
 
     if (payload or {}).get("return_code") not in (0, None):
@@ -412,7 +423,9 @@ def parse_etf_daily_trend(payload: dict[str, Any]) -> dict[str, Any]:
     rows = (payload or {}).get("etfdaly_trnsn") or []
     if not rows:
         raise ValueError("ka40003 응답에 일별 행이 없다")
-    row = rows[0]
+    row = next((r for r in rows if _signed(r.get("nav"))), None)
+    if row is None:
+        raise ValueError("ka40003 응답에 NAV가 있는 행이 없다")
     close = _signed(row.get("cur_prc"))
     nav = _signed(row.get("nav"))
     raw_day = str(row.get("cntr_dt") or "")
@@ -464,8 +477,11 @@ NOTE = (
     "등락률의 기준이 항목마다 다르다. 지수·환율의 change_pct는 직전 일봉 종가(prev_close_date) 대비이고, "
     "선물의 change_pct는 가장 최근 미국 정규장 마감 때의 선물가(prev_close_as_of) 대비다. "
     "그래서 미국 장이 끝난 뒤의 선물 등락률은 지수의 당일 등락에 더해진 마감 이후 움직임이다. "
+    "VIX는 둘이다. reference(Cboe 공식)는 미국 장이 끝나고 몇 시간 뒤에 올라와서 한국 아침에는 "
+    "하루 전 종가일 수 있다. market(Yahoo)은 최근 값이니 두 항목의 date를 견주어 적어라. "
     "ETF NAV는 국내 장 마감 기준이고, 미국 지수 ETF의 NAV는 전일 미국 종가 기준이라 "
-    "장중 괴리율에는 밤사이 선물·환율 이동이 섞인다."
+    "장중 괴리율에는 밤사이 선물·환율 이동이 섞인다. 그날 NAV가 아직 없으면(장 전) "
+    "ETF 항목은 NAV가 있는 마지막 날의 값이고 date가 그 날짜다."
 )
 
 
@@ -486,7 +502,8 @@ async def build_market_context(
         for key, symbol in US_FUTURES_SYMBOLS.items():
             legs.append(_settle(key, _yahoo_futures(client, symbol, ttl=TTL_LIVE)))
         legs.append(_settle("usd_krw_market", _yahoo_chart(client, USD_KRW_SYMBOL, range_="5d", ttl=TTL_LIVE)))
-        legs.append(_settle("vix", _cboe_vix(client)))
+        legs.append(_settle("vix_market", _yahoo_chart(client, VIX_SYMBOL, range_="5d", ttl=TTL_LIVE)))
+        legs.append(_settle("vix_reference", _cboe_vix(client)))
         legs.append(_settle("usd_krw_reference", _ecos_usdkrw(client, now.date())))
         if kiwoom_client is not None:
             for code in ETF_TARGETS:
@@ -522,7 +539,10 @@ async def build_market_context(
         "generated_at": now.isoformat(timespec="seconds"),
         "note": NOTE,
         "us": us,
-        "vix": got.get("vix"),
+        "vix": {
+            "market": yahoo("vix_market", "Yahoo ^VIX (비공식)"),
+            "reference": got.get("vix_reference"),
+        },
         "usd_krw": {
             "market": yahoo("usd_krw_market", "Yahoo KRW=X (비공식, 장중 환율)"),
             "reference": got.get("usd_krw_reference"),

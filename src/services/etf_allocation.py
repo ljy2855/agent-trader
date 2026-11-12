@@ -33,6 +33,23 @@ def verified_assets(summary: dict) -> int:
     return assets
 
 
+def _cause(*failed_reads: Any) -> str:
+    """The first failed read's own account of itself, as a message suffix.
+
+    A read that cannot be used stops the plan with an exception, and the
+    exception text is all the watcher records. Three single ticks stopped on
+    the account read on 2026-11-12 and nothing could say whether Kiwoom had
+    timed out, dropped the connection or answered with an error: the read's
+    result carried the reason, and the message left it out.
+    """
+    for read in failed_reads:
+        if isinstance(read, dict):
+            for key in ("error", "warning"):
+                if read.get(key):
+                    return f" — {str(read[key])[:200]}"
+    return ""
+
+
 def allocation_orders(
     *, assets: float, holdings: list[dict], prices: dict[str, float], now: datetime,
 ) -> dict[str, list[dict]]:
@@ -97,7 +114,7 @@ async def plan_etf_allocation(client, settings, *, holding_observer=None,
     if holding_observer is not None and evaluation.get("success"):
         await holding_observer(holdings)
     if not evaluation.get("success") or evaluation.get("warning"):
-        raise ValueError("ETF 배분을 위한 계좌 조회 불완전")
+        raise ValueError("ETF 배분을 위한 계좌 조회 불완전" + _cause(evaluation))
     raw = evaluation.get("evaluation_data")
     if (not isinstance(raw, list) or len(raw) != 1 or not isinstance(raw[0], dict)
             or not isinstance(raw[0].get("stk_acnt_evlt_prst"), list)):
@@ -124,8 +141,14 @@ async def plan_etf_allocation(client, settings, *, holding_observer=None,
     regime = _build_market_regime(snapshot, leaders_market_tp="001")
     details = {normalized_code(d.get("stock_code")): d for d in snapshot.get("watchlist_details", [])}
     prices = {c: _to_price((details.get(c, {}).get("quote") or {}).get("cur_prc")) or 0 for c in TARGETS}
-    if any(details.get(c, {}).get("success") is not True for c in TARGETS):
-        raise ValueError("ETF 시세 조회 불완전")
+    unread = [c for c in TARGETS if details.get(c, {}).get("success") is not True]
+    if unread:
+        bundle = details.get(unread[0], {})
+        parts = (bundle.get(k) for k in ("quote_result", "orderbook_result", "daily_bars_result"))
+        raise ValueError(
+            f"ETF 시세 조회 불완전({', '.join(unread)})"
+            + _cause(*(p for p in parts if isinstance(p, dict) and not p.get("success")))
+        )
     deltas = allocation_orders(assets=assets, holdings=holdings, prices=prices, now=now)
     orders_complete = bool(
         orders.get("success") and not orders.get("warning")
