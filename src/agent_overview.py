@@ -287,7 +287,8 @@ def _fetch_issues_for_date(ctx: _MulticaContext, date: str) -> list[dict[str, An
         [
             "issue", "list",
             "--project", ctx.project,
-            "--limit", "200",
+            # A page is 100 rows at most; multica 0.9.0 refuses a larger limit.
+            "--limit", "100",
             "--sort", "created_at",
             "--direction", "desc",
             "--output", "json",

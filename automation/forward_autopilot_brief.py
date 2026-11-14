@@ -420,10 +420,12 @@ def _is_daily_container(issue: dict) -> bool:
 def _list_by_status(status: str) -> list[dict] | None:
     """The project's issues in one status, or None when the list fails."""
 
+    # A page is 100 rows at most, and multica 0.9.0 refuses a larger limit.
+    # More than that in one status is cleared over the following runs.
     rc, out, err = _run(
         [
             "issue", "list", "--project", PROJECT,
-            "--status", status, "--limit", "200", "--output", "json",
+            "--status", status, "--limit", "100", "--output", "json",
         ]
     )
     if rc != 0:

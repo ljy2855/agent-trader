@@ -109,7 +109,8 @@ def _cleanup_cli(monkeypatch, *, by_status, comments):
     def run(args):
         if args[:2] == ["issue", "list"]:
             rows = by_status.get(args[args.index("--status") + 1], [])
-            page = {"issues": rows, "total": len(rows), "limit": 200, "offset": 0, "has_more": False}
+            limit = int(args[args.index("--limit") + 1])
+            page = {"issues": rows, "total": len(rows), "limit": limit, "offset": 0, "has_more": False}
             return 0, json.dumps(page, ensure_ascii=False), ""
         if args[:3] == ["issue", "comment", "list"]:
             asked.append(args[3])

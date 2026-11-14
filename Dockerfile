@@ -5,10 +5,12 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     MULTICA_BIN=/usr/local/bin/multica
 
-# Pin the multica CLI version. Bump in lockstep with the release the operator's
-# scheduled tasks run on macOS so mock/live behaviour stays consistent across
-# hosts. Override at build time via `--build-arg MULTICA_VERSION=...`.
-ARG MULTICA_VERSION=0.4.9
+# Pin the multica CLI version. Bump in lockstep with the daemon on the agent
+# host, after running every command this code sends against the new release:
+# 0.9.0 refuses `issue list --limit` above 100, which 0.4.9 let through
+# (tests/test_multica_issue_list.py). Override at build time via
+# `--build-arg MULTICA_VERSION=...`.
+ARG MULTICA_VERSION=0.9.0
 
 WORKDIR /app
 

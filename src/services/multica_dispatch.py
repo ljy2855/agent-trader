@@ -38,6 +38,8 @@ DEFAULT_DAILY_SUFFIX = os.environ.get("DAILY_ISSUE_SUFFIX", "장중 실거래")
 DEFAULT_COORDINATOR_AGENT = os.environ.get(
     "MULTICA_COORDINATOR_AGENT", "Kiwoom 에이전트 오케스트레이터"
 )
+# The most rows `multica issue list` gives in one answer, as its `--limit`.
+ISSUE_PAGE_ROWS = "100"
 
 ACTION_PATTERNS = (
     re.compile(r"<!--\s*ACTION:\s*([A-Z0-9_]+)", re.IGNORECASE),
@@ -329,6 +331,17 @@ class MulticaDispatcher:
     # -- issue lookup / creation ---------------------------------------------
 
     async def _list_issues(self) -> list[dict[str, Any]]:
+        """The project's hundred newest issues — where a title made today is.
+
+        One page is a hundred rows: the server never sent more whatever
+        `--limit` said, and multica 0.9.0 refuses a larger number outright.
+        Without `--sort` the page is in board order, where each status has its
+        own run of positions and the closed issues come first. With some
+        hundreds closed, an issue still open — today's — was on no page this
+        asked for, so a restarted watcher could not find the issue it had
+        made that morning and made another.
+        """
+
         rc, out, _err = await self._run_async(
             [
                 "issue",
@@ -338,7 +351,11 @@ class MulticaDispatcher:
                 "--output",
                 "json",
                 "--limit",
-                "200",
+                ISSUE_PAGE_ROWS,
+                "--sort",
+                "created_at",
+                "--direction",
+                "desc",
             ]
         )
         if rc != 0:

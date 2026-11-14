@@ -216,14 +216,15 @@ def _today_issues() -> list[dict]:
     if not PROJECT:
         return []
     # Default sort is "position" (manual kanban order), unrelated to recency,
-    # and the API caps results at 100 regardless of --limit — with 400+ issues
-    # in the project, an unsorted page can miss today's issues entirely (seen
-    # 2026-07-24: pre-open BRIEF_DONE false-positive because SWO-614 wasn't in
-    # the first 100 position-ordered issues). Sort by created_at desc so
-    # "today" is always within the first page.
+    # and a page is 100 rows at most — with 400+ issues in the project, an
+    # unsorted page can miss today's issues entirely (seen 2026-07-24:
+    # pre-open BRIEF_DONE false-positive because SWO-614 wasn't in the first
+    # 100 position-ordered issues). Sort by created_at desc so "today" is
+    # always within the first page. multica 0.9.0 refuses a limit above 100
+    # where older CLIs sent it on and got 100 rows back.
     rc, out, _err_ = _run(
         [
-            "issue", "list", "--project", PROJECT, "--limit", "200",
+            "issue", "list", "--project", PROJECT, "--limit", "100",
             "--sort", "created_at", "--direction", "desc", "--output", "json",
         ]
     )
@@ -336,7 +337,7 @@ def _ensure_ops_issue(today: str, alerts: list[str], warns: list[str]) -> None:
     title = f"[점검 필요] {today} 운영 이상"
     rc, out, _e = _run(
         [
-            "issue", "list", "--project", PROJECT, "--limit", "200",
+            "issue", "list", "--project", PROJECT, "--limit", "100",
             "--sort", "created_at", "--direction", "desc", "--output", "json",
         ]
     )
