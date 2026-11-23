@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg viewBox="0 0 960 580" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="order-ledger-states-dark-title order-ledger-states-dark-desc" id="order-ledger-states-dark-root">
+<svg viewBox="0 0 960 528" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="order-ledger-states-dark-title order-ledger-states-dark-desc" id="order-ledger-states-dark-root">
 <title id="order-ledger-states-dark-title">주문 원장의 상태</title>
 <desc id="order-ledger-states-dark-desc">주문 intent가 요청 전 INTENDED로 기록된 뒤 API 응답과 브로커 대사에 따라 미해결 상태를 거쳐 FILLED·CANCELLED·REJECTED·RELEASED로 끝나는 상태도.</desc>
 <defs>
@@ -95,6 +95,5 @@
 <text x="836" y="454" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">only via reconcile</text>
 
 <!-- notes and legend -->
-<text x="80" y="524" fill="#f5f5f5" font-size="14" font-style="italic" font-family="'Instrument Serif', 'Noto Serif', 'Noto Serif KR', serif" text-anchor="start">대사에서 브로커 행이 보이면, 미해결 상태 어디서든 FILLED · CANCELLED · REJECTED로 바로 간다.</text>
-<text x="80" y="548" fill="#bfc0c0" font-size="14" font-style="italic" font-family="'Instrument Serif', 'Noto Serif', 'Noto Serif KR', serif" text-anchor="start">RELEASED는 응답을 잃은 보호 매도만: 120초 유예 뒤, 30초 이상 간격의 완전한 조회 3번에 모두 없을 때. 매수는 다시 보내지 않는다.</text>
+
 </svg>
