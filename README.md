@@ -18,8 +18,8 @@
 ## 동작 방식
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/architecture-dark.svg">
-  <img alt="구성도: MCP client는 MCP server를 거쳐 키움 REST API를 조회하고, 키움에 주문을 내는 것은 Watcher뿐이다. Watcher는 Tier 2 트리거를 LLM agent에 묻고 ACTION 태그를 받으며, 같은 프로세스에서 order-intent ledger와 status server를 돌린다. MCP server는 status server에서 설정과 원장을 읽는다." src="docs/diagrams/architecture.svg" width="960">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/architecture-dark.png">
+  <img alt="구성도: MCP client는 MCP server를 거쳐 키움 REST API를 조회하고, 키움에 주문을 내는 것은 Watcher뿐이다. Watcher는 Tier 2 트리거를 LLM agent에 묻고 ACTION 태그를 받으며, 같은 프로세스에서 order-intent ledger와 status server를 돌린다. MCP server는 status server에서 설정과 원장을 읽는다." src="docs/diagrams/architecture.png" width="960">
 </picture>
 
 - 장중에는 30초 간격으로 돌고, 장 마감 후에는 대기
@@ -38,8 +38,8 @@
 Tier 2 응답이 주문이 되기까지
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/tier2-action-dark.svg">
-  <img alt="Tier 2 흐름도: agent의 ACTION이 timeout 안에 오지 않거나, 트리거 때보다 가격이 1.5% 넘게 움직였으면 주문 없이 끝난다. 보유 종목에 주문이 나가는 ACTION은 다른 역할 agent가 교차검토하고, 그 뒤 가격을 한 번 더 확인한 다음 적용한다." src="docs/diagrams/tier2-action.svg" width="960">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/tier2-action-dark.png">
+  <img alt="Tier 2 흐름도: agent의 ACTION이 timeout 안에 오지 않거나, 트리거 때보다 가격이 1.5% 넘게 움직였으면 주문 없이 끝난다. 보유 종목에 주문이 나가는 ACTION은 다른 역할 agent가 교차검토하고, 그 뒤 가격을 한 번 더 확인한 다음 적용한다." src="docs/diagrams/tier2-action.png" width="960">
 </picture>
 
 - agent 응답 끝의 ACTION 태그(`<!-- ACTION: HOLD -->`)로 결정을 파싱 (`src/services/multica_dispatch.py`)
@@ -68,8 +68,8 @@ Tier 2 응답이 주문이 되기까지
 원장에 적힌 주문 한 건이 거치는 상태
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/order-ledger-states-dark.svg">
-  <img alt="원장 상태도: 주문은 요청 전에 INTENDED로 기록되고, 응답에 따라 SUBMITTED, UNKNOWN, REJECTED가 된다. OPEN·PARTIAL, FILLED, CANCELLED는 브로커 대사에서만 기록된다. 미해결 상태는 같은 주문의 재전송을 막고, 응답을 잃은 보호 매도만 브로커 조회에서 계속 안 보일 때 RELEASED로 풀린다." src="docs/diagrams/order-ledger-states.svg" width="960">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/order-ledger-states-dark.png">
+  <img alt="원장 상태도: 주문은 요청 전에 INTENDED로 기록되고, 응답에 따라 SUBMITTED, UNKNOWN, REJECTED가 된다. OPEN·PARTIAL, FILLED, CANCELLED는 브로커 대사에서만 기록된다. 미해결 상태는 같은 주문의 재전송을 막고, 응답을 잃은 보호 매도만 브로커 조회에서 계속 안 보일 때 RELEASED로 풀린다." src="docs/diagrams/order-ledger-states.png" width="960">
 </picture>
 
 - 잔여 위험과 검증 절차는 `order_ledger.py`, `daily_risk.py` 모듈 docstring 참고
@@ -166,8 +166,8 @@ uv run python main_watcher.py \
 비워져야 새 종목을 사므로 전환에는 여러 거래일이 걸릴 수 있다.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/etf-allocation-dark.svg">
-  <img alt="ETF 배분 흐름도: 목표 ETF가 아닌 보유 종목은 날짜와 관계없이 전량 매도하고, 아직 없는 목표 ETF는 날짜와 관계없이 47%까지 산다. 이미 보유한 ETF는 매월 1~7일에 47%에서 10%p 이상 벗어났을 때만 47%로 맞추고, 그 밖에는 그대로 둔다." src="docs/diagrams/etf-allocation.svg" width="960">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/etf-allocation-dark.png">
+  <img alt="ETF 배분 흐름도: 목표 ETF가 아닌 보유 종목은 날짜와 관계없이 전량 매도하고, 아직 없는 목표 ETF는 날짜와 관계없이 47%까지 산다. 이미 보유한 ETF는 매월 1~7일에 47%에서 10%p 이상 벗어났을 때만 47%로 맞추고, 그 밖에는 그대로 둔다." src="docs/diagrams/etf-allocation.png" width="960">
 </picture>
 
 ```bash

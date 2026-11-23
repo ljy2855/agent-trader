@@ -8,9 +8,9 @@
       --color-ink:     #f5f5f5;
       --color-muted:   #bfc0c0;
       --color-accent:  #f08a59;
-      --font-sans:     'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
-      --font-serif:    'Instrument Serif', 'Noto Serif', 'Noto Serif KR', serif;
-      --font-mono:     'Geist Mono', ui-monospace, monospace; }
+      --font-sans:     'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
+      --font-serif:    'Instrument Serif', 'Noto Serif KR', serif;
+      --font-mono:     'Noto Sans Mono', ui-monospace, monospace; }
       #etf-allocation-dark-root { font-family: var(--font-sans); color: var(--color-ink); }
       #etf-allocation-dark-root .diagram-container { width: 100%; overflow-x: auto; }
       @media print {
@@ -36,61 +36,61 @@
 
 <!-- connector labels -->
 <rect x="358" y="100" width="28" height="12" rx="2" fill="#2d3142"/>
-<text x="372" y="109" fill="#949eb2" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">YES</text>
+<text x="372" y="109" fill="#949eb2" font-size="8" font-family="'Noto Sans Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">YES</text>
 <rect x="542" y="100" width="28" height="12" rx="2" fill="#2d3142"/>
-<text x="556" y="109" fill="#949eb2" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">YES</text>
+<text x="556" y="109" fill="#949eb2" font-size="8" font-family="'Noto Sans Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">YES</text>
 <rect x="742" y="100" width="28" height="12" rx="2" fill="#2d3142"/>
-<text x="756" y="109" fill="#f08a59" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">YES</text>
+<text x="756" y="109" fill="#f08a59" font-size="8" font-family="'Noto Sans Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">YES</text>
 <rect x="288" y="202" width="20" height="12" rx="2" fill="#2d3142"/>
-<text x="298" y="211" fill="#949eb2" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">NO</text>
+<text x="298" y="211" fill="#949eb2" font-size="8" font-family="'Noto Sans Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">NO</text>
 <rect x="472" y="202" width="20" height="12" rx="2" fill="#2d3142"/>
-<text x="482" y="211" fill="#949eb2" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">NO</text>
+<text x="482" y="211" fill="#949eb2" font-size="8" font-family="'Noto Sans Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">NO</text>
 <rect x="664" y="202" width="20" height="12" rx="2" fill="#2d3142"/>
-<text x="674" y="211" fill="#949eb2" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">NO</text>
+<text x="674" y="211" fill="#949eb2" font-size="8" font-family="'Noto Sans Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">NO</text>
 
 <!-- nodes -->
 <rect x="40" y="92" width="128" height="56" rx="20" fill="#2d3142"/>
 <rect x="40" y="92" width="128" height="56" rx="20" fill="#f5f5f5" stroke="#f5f5f5" stroke-width="1" fill-opacity="0.03" stroke-opacity="0.3"/>
-<text x="104" y="118" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">종목마다</text>
-<text x="104" y="134" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">holdings + 2 ETFs</text>
+<text x="104" y="118" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">종목마다</text>
+<text x="104" y="134" fill="#bfc0c0" font-size="9" font-family="'Noto Sans Mono', ui-monospace, monospace" text-anchor="middle">holdings + 2 ETFs</text>
 <polygon points="280,72 352,120 280,168 208,120" fill="#2d3142"/>
 <polygon points="280,72 352,120 280,168 208,120" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-<text x="280" y="124" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">목표 ETF인가?</text>
+<text x="280" y="124" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">목표 ETF인가?</text>
 <polygon points="464,72 536,120 464,168 392,120" fill="#2d3142"/>
 <polygon points="464,72 536,120 464,168 392,120" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-<text x="464" y="124" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">이미 보유 중?</text>
+<text x="464" y="124" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">이미 보유 중?</text>
 <polygon points="656,72 736,120 656,168 576,120" fill="#2d3142"/>
 <polygon points="656,72 736,120 656,168 576,120" fill="#f08a59" stroke="#f08a59" stroke-width="1" fill-opacity="0.08"/>
-<text x="656" y="117" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">매월 1~7일이고</text>
-<text x="656" y="133" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">10%p 이상 이탈?</text>
+<text x="656" y="117" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">매월 1~7일이고</text>
+<text x="656" y="133" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">10%p 이상 이탈?</text>
 <rect x="776" y="88" width="144" height="64" rx="6" fill="#2d3142"/>
 <rect x="776" y="88" width="144" height="64" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-<text x="848" y="118" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">47%로 조정</text>
-<text x="848" y="134" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">buy or sell the gap</text>
+<text x="848" y="118" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">47%로 조정</text>
+<text x="848" y="134" fill="#bfc0c0" font-size="9" font-family="'Noto Sans Mono', ui-monospace, monospace" text-anchor="middle">buy or sell the gap</text>
 <rect x="200" y="248" width="160" height="64" rx="6" fill="#2d3142"/>
 <rect x="200" y="248" width="160" height="64" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-<text x="280" y="278" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">전량 매도</text>
-<text x="280" y="294" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">legacy stock · any day</text>
+<text x="280" y="278" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">전량 매도</text>
+<text x="280" y="294" fill="#bfc0c0" font-size="9" font-family="'Noto Sans Mono', ui-monospace, monospace" text-anchor="middle">legacy stock · any day</text>
 <rect x="384" y="248" width="160" height="64" rx="6" fill="#2d3142"/>
 <rect x="384" y="248" width="160" height="64" rx="6" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-<text x="464" y="278" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">47%까지 매수</text>
-<text x="464" y="294" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">first entry · any day</text>
+<text x="464" y="278" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">47%까지 매수</text>
+<text x="464" y="294" fill="#bfc0c0" font-size="9" font-family="'Noto Sans Mono', ui-monospace, monospace" text-anchor="middle">first entry · any day</text>
 <rect x="576" y="252" width="160" height="56" rx="20" fill="#2d3142"/>
 <rect x="576" y="252" width="160" height="56" rx="20" fill="#f5f5f5" stroke="#f5f5f5" stroke-width="1" fill-opacity="0.03" stroke-opacity="0.3"/>
-<text x="656" y="278" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">그대로 둠</text>
-<text x="656" y="294" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">no order</text>
+<text x="656" y="278" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">그대로 둠</text>
+<text x="656" y="294" fill="#bfc0c0" font-size="9" font-family="'Noto Sans Mono', ui-monospace, monospace" text-anchor="middle">no order</text>
 
 <!-- notes and legend -->
 <line x1="40" y1="352" x2="920" y2="352" stroke="#f5f5f5" stroke-width="0.8" stroke-opacity="0.1"/>
-<text x="40" y="368" fill="#bfc0c0" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" letter-spacing="0.18em">LEGEND</text>
+<text x="40" y="368" fill="#bfc0c0" font-size="8" font-family="'Noto Sans Mono', ui-monospace, monospace" letter-spacing="0.18em">LEGEND</text>
 <rect x="40" y="380" width="24" height="12" rx="6" fill="#f5f5f5" stroke="#f5f5f5" stroke-width="1" fill-opacity="0.03" stroke-opacity="0.3"/>
-<text x="70" y="389" fill="#bfc0c0" font-size="8.5" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif">Start / end</text>
+<text x="70" y="389" fill="#bfc0c0" font-size="8.5" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif">Start / end</text>
 <rect x="154" y="381" width="14" height="10" rx="2" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-<text x="174" y="389" fill="#bfc0c0" font-size="8.5" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif">Planned order</text>
+<text x="174" y="389" fill="#bfc0c0" font-size="8.5" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif">Planned order</text>
 <polygon points="266,386 278,380 290,386 278,392" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
-<text x="296" y="389" fill="#bfc0c0" font-size="8.5" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif">Decision</text>
+<text x="296" y="389" fill="#bfc0c0" font-size="8.5" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif">Decision</text>
 <rect x="364" y="381" width="14" height="10" rx="2" fill="#f08a59" stroke="#f08a59" stroke-width="1" fill-opacity="0.08"/>
-<text x="384" y="389" fill="#bfc0c0" font-size="8.5" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif">Rebalance window</text>
+<text x="384" y="389" fill="#bfc0c0" font-size="8.5" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif">Rebalance window</text>
 <line x1="492" y1="386" x2="520" y2="386" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#etf-allocation-dark-arrow)"/>
-<text x="526" y="389" fill="#bfc0c0" font-size="8.5" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif">Branch</text>
+<text x="526" y="389" fill="#bfc0c0" font-size="8.5" font-family="'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif">Branch</text>
 </svg>
