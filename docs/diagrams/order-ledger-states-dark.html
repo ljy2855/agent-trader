@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>주문 원장의 상태</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Noto+Serif:ital@0;1&amp;family=Noto+Sans+KR:wght@400;500;600&amp;family=Noto+Serif+KR:wght@400&amp;family=Noto+Sans+TC:wght@400;500;600&amp;family=Noto+Serif+TC:wght@400&amp;display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #2d3142;
+      --color-ink:     #f5f5f5;
+      --color-muted:   #bfc0c0;
+      --color-accent:  #f08a59;
+      --font-sans:     'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
+      --font-serif:    'Instrument Serif', 'Noto Serif', 'Noto Serif KR', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+
+    .frame { max-width: 1200px; width: 100%; }
+    .diagram-container { width: 100%; overflow-x: auto; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 1.5rem;
+    }
+
+    svg { width: 100%; min-width: 960px; display: block; }
+    @media print {
+      .diagram-container { overflow-x: visible; }
+      svg { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">State machine · order_ledger.py</p>
+    <h1>주문 원장의 상태</h1>
+
+    <div class="diagram-container">
+<svg viewBox="0 0 960 580" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="order-ledger-states-dark-title order-ledger-states-dark-desc">
+<title id="order-ledger-states-dark-title">주문 원장의 상태</title>
+<desc id="order-ledger-states-dark-desc">주문 intent가 요청 전 INTENDED로 기록된 뒤 API 응답과 브로커 대사에 따라 미해결 상태를 거쳐 FILLED·CANCELLED·REJECTED·RELEASED로 끝나는 상태도.</desc>
+<defs>
+<marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bfc0c0"/></marker>
+<marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#f08a59"/></marker>
+<marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#739fdf"/></marker>
+</defs>
+<rect width="100%" height="100%" fill="#2d3142"/>
+
+<!-- zones -->
+<rect x="80" y="80" width="664" height="248" rx="8" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.1)" stroke-width="0.8"/>
+<rect x="92" y="84" width="196" height="12" rx="2" fill="#2d3142"/>
+<text x="190" y="93" fill="#949eb2" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">UNRESOLVED — BLOCKS A REPEAT ORDER</text>
+<rect x="80" y="376" width="840" height="112" rx="8" fill="rgba(245,245,245,0.02)" stroke="rgba(245,245,245,0.1)" stroke-width="0.8"/>
+<rect x="92" y="380" width="56" height="12" rx="2" fill="#2d3142"/>
+<text x="120" y="389" fill="#949eb2" font-size="7" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.14em">TERMINAL</text>
+
+<!-- connectors (drawn before nodes) -->
+<path d="M 62,144 H 96" fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 256,144 H 320" fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 204,176 V 264 Q 204,272 212,272 H 320" fill="none" stroke="#f08a59" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+<path d="M 148,176 V 408" fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 480,144 H 560" fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 480,272 H 604 Q 612,272 612,264 V 176" fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 668,176 V 408" fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 720,144 H 828 Q 836,144 836,152 V 408" fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+<path d="M 400,304 V 408" fill="none" stroke="#bfc0c0" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+<!-- connector labels -->
+<rect x="260" y="124" width="56" height="12" rx="2" fill="#2d3142"/>
+<text x="288" y="133" fill="#949eb2" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">ACCEPTED</text>
+<rect x="224" y="252" width="84" height="12" rx="2" fill="#2d3142"/>
+<text x="266" y="261" fill="#f08a59" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">TIMEOUT · 5XX</text>
+<rect x="92" y="346" width="48" height="12" rx="2" fill="#2d3142"/>
+<text x="116" y="355" fill="#949eb2" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">REFUSED</text>
+<rect x="490" y="124" width="60" height="12" rx="2" fill="#2d3142"/>
+<text x="520" y="133" fill="#949eb2" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">RECONCILE</text>
+<rect x="496" y="252" width="92" height="12" rx="2" fill="#2d3142"/>
+<text x="542" y="261" fill="#949eb2" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">FOUND AT BROKER</text>
+<rect x="676" y="346" width="84" height="12" rx="2" fill="#2d3142"/>
+<text x="718" y="355" fill="#949eb2" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">BROKER CANCEL</text>
+<rect x="738" y="124" width="88" height="12" rx="2" fill="#2d3142"/>
+<text x="782" y="133" fill="#949eb2" font-size="8" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle" letter-spacing="0.08em">FILL CONFIRMED</text>
+<rect x="408" y="344" width="120" height="16" rx="2" fill="#2d3142"/>
+<text x="468" y="356" fill="#949eb2" font-size="12" font-weight="500" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">매도만 · 3회 부재</text>
+
+<!-- nodes -->
+<circle cx="56" cy="144" r="6" fill="#f5f5f5"/>
+<rect x="96" y="112" width="160" height="64" rx="8" fill="#2d3142"/>
+<rect x="96" y="112" width="160" height="64" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+<text x="176" y="142" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">INTENDED</text>
+<text x="176" y="158" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">written before the call</text>
+<rect x="320" y="112" width="160" height="64" rx="8" fill="#2d3142"/>
+<rect x="320" y="112" width="160" height="64" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+<text x="400" y="142" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">SUBMITTED</text>
+<text x="400" y="158" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">broker accepted</text>
+<rect x="560" y="112" width="160" height="64" rx="8" fill="#2d3142"/>
+<rect x="560" y="112" width="160" height="64" rx="8" fill="#393e53" stroke="#f5f5f5" stroke-width="1"/>
+<text x="640" y="142" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">OPEN · PARTIAL</text>
+<text x="640" y="158" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">working at broker</text>
+<rect x="320" y="240" width="160" height="64" rx="8" fill="#2d3142"/>
+<rect x="320" y="240" width="160" height="64" rx="8" fill="rgba(240,138,89,0.08)" stroke="#f08a59" stroke-width="1"/>
+<text x="400" y="270" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">UNKNOWN</text>
+<text x="400" y="286" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">treated as sent</text>
+<rect x="96" y="408" width="160" height="64" rx="8" fill="#2d3142"/>
+<rect x="96" y="408" width="160" height="64" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+<text x="176" y="438" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">REJECTED</text>
+<text x="176" y="454" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">safe to retry</text>
+<rect x="320" y="408" width="160" height="64" rx="8" fill="#2d3142"/>
+<rect x="320" y="408" width="160" height="64" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+<text x="400" y="438" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">RELEASED</text>
+<text x="400" y="454" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">sell lock freed</text>
+<rect x="560" y="408" width="160" height="64" rx="8" fill="#2d3142"/>
+<rect x="560" y="408" width="160" height="64" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+<text x="640" y="438" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">CANCELLED</text>
+<text x="640" y="454" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">seen at broker</text>
+<rect x="768" y="408" width="136" height="64" rx="8" fill="#2d3142"/>
+<rect x="768" y="408" width="136" height="64" rx="8" fill="rgba(245,245,245,0.05)" stroke="#bfc0c0" stroke-width="1"/>
+<text x="836" y="438" fill="#f5f5f5" font-size="12" font-weight="600" font-family="'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif" text-anchor="middle">FILLED</text>
+<text x="836" y="454" fill="#bfc0c0" font-size="9" font-family="'Geist Mono', ui-monospace, monospace" text-anchor="middle">only via reconcile</text>
+
+<!-- notes and legend -->
+<text x="80" y="524" fill="#f5f5f5" font-size="14" font-style="italic" font-family="'Instrument Serif', 'Noto Serif', 'Noto Serif KR', serif" text-anchor="start">대사에서 브로커 행이 보이면, 미해결 상태 어디서든 FILLED · CANCELLED · REJECTED로 바로 간다.</text>
+<text x="80" y="548" fill="#bfc0c0" font-size="14" font-style="italic" font-family="'Instrument Serif', 'Noto Serif', 'Noto Serif KR', serif" text-anchor="start">RELEASED는 응답을 잃은 보호 매도만: 120초 유예 뒤, 30초 이상 간격의 완전한 조회 3번에 모두 없을 때. 매수는 다시 보내지 않는다.</text>
+</svg>
+    </div>
+  </div>
+</body>
+</html>
