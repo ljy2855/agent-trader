@@ -67,6 +67,10 @@ TERMINAL_LEDGER_STATES = frozenset({"FILLED", "CANCELLED", "REJECTED", "RELEASED
 # retried. The client waits 1.2 s (paced account reads) or 0.75 s (market
 # reads) before asking again.
 RETRY_WINDOW_SECONDS = 3.0
+# How many times in a row one read can be refused before the client gives up.
+# Market reads ask up to three times (waiting 0.75 s, then 1.5 s), so a retry
+# can itself be refused and the third ask still get through.
+MAX_ATTEMPTS = 3
 
 # Warnings the watcher prints on healthy days. Each is still counted; it is
 # graded as information rather than a finding.
@@ -259,6 +263,43 @@ def _offset(text: str) -> timezone:
     return timezone(sign * timedelta(hours=hours, minutes=minutes))
 
 
+def _pair_rate_limited(http: list[tuple[datetime, str, int]]) -> tuple[int, list[str]]:
+    """Count the 429s that a retry got past, and list the ones none did.
+
+    A refused read is asked again a moment later, and that retry can be refused
+    too. So the 429s of one endpoint are followed as a run: each next answer of
+    that endpoint has to come within the window of the one before. A run that
+    ends in a 200 was retried, every 429 in it; a run that ends any other way,
+    or reaches ``MAX_ATTEMPTS`` refusals, means the client gave up.
+    """
+
+    retried = 0
+    unrecovered: list[str] = []
+    runs: dict[str, list[datetime]] = {}
+
+    def give_up(endpoint: str) -> None:
+        unrecovered.extend(f"{at:%H:%M:%S} {endpoint}" for at in runs.pop(endpoint))
+
+    for at, endpoint, status in http:
+        run = runs.get(endpoint)
+        if run and (at - run[-1]).total_seconds() > RETRY_WINDOW_SECONDS:
+            give_up(endpoint)
+            run = None
+        if status == 429:
+            runs.setdefault(endpoint, []).append(at)
+            if len(runs[endpoint]) >= MAX_ATTEMPTS:
+                give_up(endpoint)
+        elif run:
+            if status == 200:
+                retried += len(runs.pop(endpoint))
+            else:
+                give_up(endpoint)
+    for endpoint in list(runs):
+        give_up(endpoint)
+    unrecovered.sort()
+    return retried, unrecovered
+
+
 def summarize_watcher_log(lines: list[LogLine], opens: datetime, closes: datetime) -> dict[str, Any]:
     """HTTP status counts, 429 retries, warnings and session coverage."""
 
@@ -291,16 +332,7 @@ def summarize_watcher_log(lines: list[LogLine], opens: datetime, closes: datetim
             warnings[key] += 1
 
     statuses = Counter(f"{endpoint} {status}" for _, endpoint, status in http)
-    unrecovered: list[str] = []
-    retried = 0
-    for index, (at, endpoint, status) in enumerate(http):
-        if status != 429:
-            continue
-        follow = next(((t, s) for t, e, s in http[index + 1:] if e == endpoint), None)
-        if follow and follow[1] == 200 and (follow[0] - at).total_seconds() <= RETRY_WINDOW_SECONDS:
-            retried += 1
-        else:
-            unrecovered.append(f"{at:%H:%M:%S} {endpoint}")
+    retried, unrecovered = _pair_rate_limited(http)
     other_errors = [f"{at:%H:%M:%S} {e} {s}" for at, e, s in http if s not in (200, 429)]
 
     session_minutes = int((closes - opens).total_seconds() // 60)

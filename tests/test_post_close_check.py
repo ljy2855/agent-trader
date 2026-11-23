@@ -162,6 +162,42 @@ def test_429_answered_by_the_same_endpoint_within_the_window_counts_as_retried()
     assert summary["http_status_counts"]["acnt 429"] == 1
 
 
+def test_a_refused_retry_that_gets_through_on_the_third_ask_counts_as_retried():
+    # 11/23 10:58: a market read was refused, its retry 0.75 s later was
+    # refused too, and the third ask 1.5 s after that was answered.
+    raw = [
+        _http("10:58:17", "mrkcond", 429),
+        _http("10:58:18", "mrkcond", 429),
+        _http("10:58:19", "mrkcond", 200),
+        _http("10:58:19", "mrkcond", 200),
+    ]
+    opens, closes = pc.session_hours(FRIDAY)
+    summary = pc.summarize_watcher_log(pc.parse_kubelet_lines(raw, FRIDAY), opens, closes)
+    assert summary["rate_limited"] == 2
+    assert summary["rate_limited_retried"] == 2
+    assert summary["rate_limited_unrecovered"] == []
+
+
+def test_three_refusals_in_a_row_mean_the_client_gave_up():
+    raw = [
+        _http("10:00:00", "mrkcond", 429),
+        _http("10:00:01", "mrkcond", 429),
+        _http("10:00:02", "mrkcond", 429),
+        _http("10:00:02", "mrkcond", 200),  # the next read, not a retry
+        _http("10:30:00", "acnt", 429),
+        _http("10:30:01", "acnt", 500),  # answered, but not with the data
+    ]
+    opens, closes = pc.session_hours(FRIDAY)
+    summary = pc.summarize_watcher_log(pc.parse_kubelet_lines(raw, FRIDAY), opens, closes)
+    assert summary["rate_limited_retried"] == 0
+    assert summary["rate_limited_unrecovered"] == [
+        "10:00:00 mrkcond",
+        "10:00:01 mrkcond",
+        "10:00:02 mrkcond",
+        "10:30:00 acnt",
+    ]
+
+
 def test_session_coverage_counts_minutes_with_any_read():
     raw = [_http(f"09:{minute:02d}:10", "sect", 200) for minute in range(0, 60)]
     opens, closes = pc.session_hours(FRIDAY)
