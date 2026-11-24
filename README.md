@@ -17,18 +17,10 @@
 
 ## 동작 방식
 
-```mermaid
-flowchart LR
-    client["MCP client"] -->|stdio / HTTP| mcp["MCP server<br/>main.py · main_http.py"]
-    mcp --> kiwoom[("Kiwoom REST API<br/>api · mockapi")]
-    watcher["Watcher<br/>main_watcher.py"] -->|계좌·시세·주문| kiwoom
-    kiwoom -.->|체결 스트림, 선택| watcher
-    watcher -->|Tier 2 트리거| agents["LLM agents<br/>Multica, 선택"]
-    agents -->|ACTION 태그| watcher
-    watcher --> ledger[("order-intent ledger<br/>SQLite")]
-    watcher --> status["status server<br/>/health /state /recent /ledger"]
-    mcp -.->|설정·원장 조회| status
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/architecture-dark.png">
+  <img alt="구성도: MCP client는 MCP server를 거쳐 키움 REST API를 조회하고, 키움에 주문을 내는 것은 Watcher뿐이다. Watcher는 Tier 2 트리거를 LLM agent에 묻고 ACTION 태그를 받으며, 같은 프로세스에서 order-intent ledger와 status server를 돌린다. MCP server는 status server에서 설정과 원장을 읽는다." src="docs/diagrams/architecture.png" width="960">
+</picture>
 
 - 장중에는 30초 간격으로 돌고, 장 마감 후에는 대기
 - strategy planner는 데이터 소스(regime, 보유 종목, 후보 점수)로만 쓰고 주문은 전부 watcher가 실행
@@ -42,6 +34,13 @@ flowchart LR
 | 2    | 새 후보가 점수 기준을 넘음                       | screener squad     | `TIER1`(예산 전액) · `TIER2`(절반) · `REJECT`                 |
 | 2    | regime 전환, 급락장, 정기 점검                 | PM squad           | 참고만 (주문 없음)                                             |
 | 2    | API 실패 반복, 미체결 누적                     | risk manager agent | 참고만 (주문 없음)                                             |
+
+Tier 2 응답이 주문이 되기까지
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/tier2-action-dark.png">
+  <img alt="Tier 2 흐름도: agent의 ACTION이 timeout 안에 오지 않거나, 트리거 때보다 가격이 1.5% 넘게 움직였으면 주문 없이 끝난다. 보유 종목에 주문이 나가는 ACTION은 다른 역할 agent가 교차검토하고, 그 뒤 가격을 한 번 더 확인한 다음 적용한다." src="docs/diagrams/tier2-action.png" width="960">
+</picture>
 
 - agent 응답 끝의 ACTION 태그(`<!-- ACTION: HOLD -->`)로 결정을 파싱 (`src/services/multica_dispatch.py`)
 - 보유 종목에 주문이 나가는 응답은 역할이 다른 agent가 교차 검토
@@ -65,6 +64,13 @@ flowchart LR
 | 일일 circuit breaker | 하루 손실(%·원)과 신규 진입 횟수 상한. 거래일 단위로 유지되고 재시작해도 안 풀림. 손실 상한을 `--acknowledge-daily-loss-source-verified` 없이 걸면 신규 매수 전면 차단 (손익 필드 검증 전까지 불신) | `src/services/daily_risk.py`     |
 | 시장 가드              | KRX 휴장일 캘린더 (현재 2026년만 지원, `docs/krx-calendar-maintenance.md`). 미지원 연도는 신규 매수 차단. 지수 급락이나 지수 데이터 불완전 시 진입 veto                          | `krx_calendar.py`, `strategy.py` |
 | stale 응답 폐기        | agent 응답 동안 가격이 `--stale-price-delta-pct`(1.5%) 넘게 움직이면 ACTION 폐기. `--agent-timeout-seconds` 안에 응답이 없으면 아무것도 안 함                        | `watcher.py`                     |
+
+원장에 적힌 주문 한 건이 거치는 상태
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/order-ledger-states-dark.png">
+  <img alt="원장 상태도: 주문은 요청 전에 INTENDED로 기록되고, 응답에 따라 SUBMITTED, UNKNOWN, REJECTED가 된다. OPEN·PARTIAL, FILLED, CANCELLED는 브로커 대사에서만 기록된다. 미해결 상태는 같은 주문의 재전송을 막고, 응답을 잃은 보호 매도만 브로커 조회에서 계속 안 보일 때 RELEASED로 풀린다." src="docs/diagrams/order-ledger-states.png" width="960">
+</picture>
 
 - 잔여 위험과 검증 절차는 `order_ledger.py`, `daily_risk.py` 모듈 docstring 참고
 - 키움이 client order id를 지원하지 않아 exactly-once는 불가능. 원장은 중복을 보수적으로 막는 수준
@@ -158,6 +164,11 @@ uv run python main_watcher.py \
 벗어난 보유만 조정한다. 처음 편입하는 ETF와 기존 개별주식의 전환 청산은 날짜와 무관하게 계획한다.
 모든 배분 주문은 기존 watcher의 종가 동시호가·원장 경로를 사용한다. 매도 체결 후 슬롯이
 비워져야 새 종목을 사므로 전환에는 여러 거래일이 걸릴 수 있다.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/etf-allocation-dark.png">
+  <img alt="ETF 배분 흐름도: 목표 ETF가 아닌 보유 종목은 날짜와 관계없이 전량 매도하고, 아직 없는 목표 ETF는 날짜와 관계없이 47%까지 산다. 이미 보유한 ETF는 매월 1~7일에 47%에서 10%p 이상 벗어났을 때만 47%로 맞추고, 그 밖에는 그대로 둔다." src="docs/diagrams/etf-allocation.png" width="960">
+</picture>
 
 ```bash
 uv run python main_watcher.py --entry-mode etf_allocation \
@@ -262,7 +273,7 @@ src/
 automation/           운영 스크립트: Discord 브리핑과 점검, health check, 체결 기록, 신호 검증
 backtest/             오프라인 simulator와 검증 통계
 tests/                pytest. 네트워크 없이 돈다
-docs/                 투자 이론 학습 노트, KRX 캘린더 관리 절차
+docs/                 투자 이론 학습 노트, KRX 캘린더 관리 절차, README 그림 원본(diagrams/)
 kiwoom_api_spec.md    키움 REST API 문서를 손으로 옮겨 적은 메모
 ```
 
