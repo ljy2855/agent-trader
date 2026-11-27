@@ -11,7 +11,8 @@ Gathering those by hand meant re-deriving a dozen commands every time, so this
 script does it in one pass and prints a graded summary.
 
 It only reads. It calls ``kubectl get``, ``kubectl get --raw`` (watcher
-``/state`` and ``/ledger``, MCP ``/api/dashboard``) and ``kubectl logs``, and,
+``/state`` and ``/ledger``, MCP ``/api/dashboard``, and the kubelet's rotated
+container log files through ``nodes/proxy``) and ``kubectl logs``, and,
 when ``--agent-host`` is given, runs a fixed read-only probe over ssh. It never
 places, cancels or changes orders, workloads, config or secrets, and it never
 sends anything anywhere: the operator writes the message and sends it.
@@ -38,6 +39,7 @@ file: ``OPS_AGENT_HOST`` (ssh target of the agent runtime host),
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import os
 import re
@@ -47,7 +49,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -88,6 +90,8 @@ REALTIME_DROP = re.compile(r"realtime stream error")
 REALTIME_DROPS_WARN = 10
 
 _KUBELET_LINE = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})\s(.*)$")
+_CRI_LINE = re.compile(r"^(\S+) (stdout|stderr) ([FP]) ?(.*)$")
+_ROTATED_LOG = re.compile(r'href="(\d+\.log\.(\d{8}-\d{6})(?:\.gz)?)"')
 _HTTP_LINE = re.compile(r'HTTP Request: (?:GET|POST) \S+/(?P<endpoint>[^/\s"]+) "HTTP/1\.1 (?P<status>\d{3})')
 _LEVEL = re.compile(r"\s(WARNING|ERROR|CRITICAL)\s")
 _INGRESS_EMPTY_MCP = re.compile(r'"POST /mcp HTTP/1\.1" 200 0 .*?(\d+)ms\s*$')
@@ -245,22 +249,91 @@ def parse_kubelet_lines(lines: Iterable[str], day: date) -> list[LogLine]:
 
     kept: list[LogLine] = []
     for raw in lines:
-        match = _KUBELET_LINE.match(raw.rstrip("\n"))
-        if not match:
-            continue
-        stamp, fraction, offset, text = match.groups()
-        micro = (fraction or ".0")[1:7].ljust(6, "0")
-        tz = timezone.utc if offset == "Z" else _offset(offset)
-        at = datetime.fromisoformat(stamp).replace(microsecond=int(micro), tzinfo=tz).astimezone(KST)
-        if at.date() == day:
-            kept.append(LogLine(at, text))
+        line = _kubelet_line(raw)
+        if line and line.at.date() == day:
+            kept.append(line)
     return kept
+
+
+def _kubelet_line(raw: str) -> LogLine | None:
+    match = _KUBELET_LINE.match(raw.rstrip("\n"))
+    if not match:
+        return None
+    stamp, fraction, offset, text = match.groups()
+    micro = (fraction or ".0")[1:7].ljust(6, "0")
+    tz = timezone.utc if offset == "Z" else _offset(offset)
+    return LogLine(datetime.fromisoformat(stamp).replace(microsecond=int(micro), tzinfo=tz).astimezone(KST), text)
 
 
 def _offset(text: str) -> timezone:
     sign = 1 if text[0] == "+" else -1
     hours, minutes = int(text[1:3]), int(text[4:6])
     return timezone(sign * timedelta(hours=hours, minutes=minutes))
+
+
+def parse_cri_lines(lines: Iterable[str]) -> list[str]:
+    """Turn the lines of a kubelet log file into ``kubectl logs --timestamps`` lines.
+
+    On disk each line is ``<time> <stream> <tag> <text>``. A tag ``P`` marks a
+    piece of a long line that the next pieces of the same stream continue, up
+    to the one tagged ``F``; the joined line keeps the first piece's time.
+    """
+
+    out: list[str] = []
+    pending: dict[str, tuple[str, list[str]]] = {}
+    for raw in lines:
+        match = _CRI_LINE.match(raw.rstrip("\n"))
+        if not match:
+            continue
+        stamp, stream, tag, text = match.groups()
+        first, pieces = pending.pop(stream, (stamp, []))
+        pieces.append(text)
+        if tag == "P":
+            pending[stream] = (first, pieces)
+        else:
+            out.append(f"{first} {''.join(pieces)}")
+    out.extend(f"{first} {''.join(pieces)}" for first, pieces in pending.values())
+    return out
+
+
+def rotated_log_files(listing: str, since: datetime) -> list[str]:
+    """Rotated files in a kubelet container log directory that may hold lines from ``since`` on.
+
+    When ``N.log`` reaches ``containerLogMaxSize`` the kubelet renames it to
+    ``N.log.<YYYYmmdd-HHMMSS>`` (its local time) and later gzips it, and
+    ``kubectl logs`` stops returning those lines. A file holds nothing newer
+    than its stamp, so one stamped more than a day before ``since`` (room for
+    the node's time zone) is left unread. Newest first.
+    """
+
+    floor = since.astimezone(KST).replace(tzinfo=None) - timedelta(days=1)
+    found = {}
+    for name, stamp in _ROTATED_LOG.findall(listing):
+        if datetime.strptime(stamp, "%Y%m%d-%H%M%S") >= floor:
+            found[name] = stamp
+    return sorted(found, key=lambda name: found[name], reverse=True)
+
+
+def read_rotated_logs(names: list[str], read: Callable[[str], bytes], since: datetime) -> tuple[list[str], list[str]]:
+    """Read rotated files newest first until one starts before ``since``.
+
+    Returns the lines oldest first, in ``kubectl logs --timestamps`` form, and
+    the names of the files read.
+    """
+
+    chunks: list[list[str]] = []
+    done: list[str] = []
+    for name in names:
+        data = read(name)
+        if name.endswith(".gz"):
+            data = gzip.decompress(data)
+        lines = parse_cri_lines(data.decode("utf-8", errors="replace").splitlines())
+        chunks.append(lines)
+        done.append(name)
+        first = next((line for line in map(_kubelet_line, lines) if line), None)
+        if first and first.at < since:
+            break
+    return [line for chunk in reversed(chunks) for line in chunk], done
 
 
 def _pair_rate_limited(http: list[tuple[datetime, str, int]]) -> tuple[int, list[str]]:
@@ -395,15 +468,60 @@ class Kube:
         url = f"/api/v1/namespaces/{self.namespace}/services/{service_port}/proxy{path}"
         return json.loads(self._run(["get", "--raw", url]))
 
-    def logs(self, target: str, since: datetime, namespace: str | None = None) -> list[str]:
-        out = self._run(
+    def raw_bytes(self, path: str) -> bytes:
+        done = subprocess.run([self.kubectl, "get", "--raw", path], capture_output=True, timeout=300)
+        if done.returncode != 0:
+            raise RuntimeError(done.stderr.decode(errors="replace").strip() or f"kubectl get --raw {path} failed")
+        return done.stdout
+
+    def pods(self, namespace: str, deployment: str) -> list[dict[str, Any]]:
+        selector = self.json("-n", namespace, "get", "deployment", deployment)["spec"]["selector"]["matchLabels"]
+        labels = ",".join(f"{key}={value}" for key, value in sorted(selector.items()))
+        return self.json("-n", namespace, "get", "pods", "-l", labels).get("items", [])
+
+    def pod_logs(self, pod: dict[str, Any], since: datetime) -> tuple[list[str], list[tuple[str, str]]]:
+        """``kubectl logs --timestamps`` lines of a pod from ``since`` on, and graded notes.
+
+        ``kubectl logs`` only returns the container's current log file, so
+        once the kubelet rotates it (``containerLogMaxSize``, 10 MiB by
+        default) the morning of a busy day is gone from it. The rotated files
+        are read through the node's kubelet (``nodes/proxy``, read-only).
+        """
+
+        meta = pod["metadata"]
+        container = (meta.get("annotations") or {}).get("kubectl.kubernetes.io/default-container") \
+            or pod["spec"]["containers"][0]["name"]
+        notes: list[tuple[str, str]] = []
+        rotated: list[str] = []
+        base = (f"/api/v1/nodes/{pod['spec'].get('nodeName')}/proxy/logs/pods/"
+                f"{meta['namespace']}_{meta['name']}_{meta['uid']}/{container}/")
+        try:
+            names = rotated_log_files(self.raw_bytes(base).decode(errors="replace"), since)
+            rotated, read = read_rotated_logs(names, lambda name: self.raw_bytes(base + name), since)
+            if read:
+                notes.append((INFO, f"{meta['name']}: also read rotated log {', '.join(read)}"))
+        except Exception as error:
+            notes.append((WARN, f"{meta['name']}: rotated logs unreadable, counting only the current file: {str(error)[:160]}"))
+        current = self._run(
             [
-                "-n", namespace or self.namespace, "logs", target, "--timestamps",
+                "-n", meta["namespace"], "logs", meta["name"], "-c", container, "--timestamps",
                 f"--since-time={since.astimezone(timezone.utc):%Y-%m-%dT%H:%M:%SZ}",
             ],
             timeout=300,
         )
-        return out.splitlines()
+        return rotated + current.splitlines(), notes
+
+
+def day_log_lines(kube: Kube, report: Report, section: str, pods: list[dict[str, Any]]) -> list[LogLine]:
+    """That day's log lines of these pods, rotated files included, in time order."""
+
+    raw: list[str] = []
+    for pod in pods:
+        lines, notes = kube.pod_logs(pod, datetime.combine(report.day, time(0), KST))
+        raw.extend(lines)
+        for grade, note in notes:
+            report.add(grade, section, note)
+    return sorted(parse_kubelet_lines(raw, report.day), key=lambda line: line.at)
 
 
 def check_cronjobs(kube: Kube, report: Report) -> None:
@@ -474,13 +592,15 @@ def check_watcher(kube: Kube, report: Report, opens: datetime, closes: datetime)
             f"→ {row.get('state')} filled {row.get('filled_quantity')} ({row.get('origin')})"
         ))
 
-    lines = parse_kubelet_lines(kube.logs("deploy/kiwoom-watcher", datetime.combine(report.day, time(0), KST)), report.day)
+    lines = day_log_lines(kube, report, "watcher-log", pods)
     summary = summarize_watcher_log(lines, opens, closes)
     report.data["watcher_log"] = summary
     coverage = summary["session_minutes_with_reads"]
+    covered = coverage >= summary["session_minutes"] * 0.95
     report.add(
-        OK if coverage >= summary["session_minutes"] * 0.95 else ALERT, "watcher-log",
-        f"session minutes with Kiwoom reads {coverage}/{summary['session_minutes']}",
+        OK if covered else ALERT, "watcher-log",
+        f"session minutes with Kiwoom reads {coverage}/{summary['session_minutes']}"
+        + ("" if covered or not lines else f" (that day's log starts {lines[0].at:%H:%M:%S})"),
     )
     report.add(INFO, "watcher-log", f"HTTP {summary['http_status_counts']}")
     if summary["rate_limited"]:
@@ -535,8 +655,7 @@ def _int(value: Any) -> int | None:
 
 
 def check_ingress(kube: Kube, report: Report, namespace: str, deployment: str) -> None:
-    since = datetime.combine(report.day, time(0), KST)
-    lines = [line for line in parse_kubelet_lines(kube.logs(f"deploy/{deployment}", since, namespace), report.day)
+    lines = [line for line in day_log_lines(kube, report, "mcp", kube.pods(namespace, deployment))
              if "kiwoom-mcp" in line.text]
     hits = empty_mcp_responses(lines)
     report.data["empty_mcp_responses"] = hits

@@ -222,6 +222,78 @@ def test_open_tick_and_realtime_warnings_are_expected_but_others_are_not():
     assert summary["realtime_drops"] == 1
 
 
+# --- rotated kubelet log files ----------------------------------------------
+
+
+def _cri(kst_clock, text, stream="stderr", tag="F", day="2026-11-20"):
+    return f"{day}T{kst_clock}.123456789+09:00 {stream} {tag} {text}"
+
+
+def test_cri_lines_become_kubectl_lines_and_split_lines_are_joined():
+    raw = [
+        _cri("10:00:00", "one"),
+        _cri("10:00:01", "long ", tag="P"),
+        _cri("10:00:01", "stdout line", stream="stdout"),
+        _cri("10:00:02", "line", tag="F"),
+        "not a log line",
+    ]
+    assert pc.parse_cri_lines(raw) == [
+        "2026-11-20T10:00:00.123456789+09:00 one",
+        "2026-11-20T10:00:01.123456789+09:00 stdout line",
+        "2026-11-20T10:00:01.123456789+09:00 long line",
+    ]
+
+
+def test_rotated_log_files_skip_the_current_file_and_ones_rotated_long_before_the_day():
+    listing = (
+        '<a href="0.log">0.log</a> <a href="0.log.20261120-130303">x</a> '
+        '<a href="0.log.20261119-020000.gz">x</a> <a href="0.log.20261110-090000.gz">x</a>'
+    )
+    since = datetime(2026, 11, 20, tzinfo=KST)
+    assert pc.rotated_log_files(listing, since) == ["0.log.20261120-130303", "0.log.20261119-020000.gz"]
+
+
+def test_rotated_logs_are_read_newest_first_until_one_starts_before_the_day():
+    # 11/27: the kubelet rotated the watcher's log at 13:03, so `kubectl logs`
+    # began at 13:03 and the check counted 147 of 390 session minutes.
+    import gzip
+
+    files = {
+        "0.log.20261120-130303": "\n".join([
+            _cri("09:00:00", "older file ends here"),
+            _cri("13:02:55", "last line before rotation"),
+        ]).encode(),
+        "0.log.20261120-090000.gz": gzip.compress("\n".join([
+            _cri("23:00:00", "previous day", day="2026-11-19"),
+            _cri("08:59:59", "just before the first file"),
+        ]).encode()),
+        "0.log.20261119-210000.gz": b"never read",
+    }
+    read = []
+
+    def fetch(name):
+        read.append(name)
+        return files[name]
+
+    since = datetime(2026, 11, 20, tzinfo=KST)
+    lines, done = pc.read_rotated_logs(list(files), fetch, since)
+    assert done == read == ["0.log.20261120-130303", "0.log.20261120-090000.gz"]
+    assert [line.text for line in pc.parse_kubelet_lines(lines, FRIDAY)] == [
+        "just before the first file", "older file ends here", "last line before rotation",
+    ]
+
+
+def test_session_coverage_counts_the_rotated_file_too():
+    rotated = [_cri(f"{9 + m // 60:02d}:{m % 60:02d}:10", 'x httpx: HTTP Request: POST https://api.example/api/dostk/sect "HTTP/1.1 200 OK"')
+               for m in range(0, 243)]
+    current = [_http(f"{9 + m // 60:02d}:{m % 60:02d}:10", "sect", 200) for m in range(243, 390)]
+    lines, _ = pc.read_rotated_logs(["0.log.20261120-130303"], lambda name: "\n".join(rotated).encode(),
+                                    datetime(2026, 11, 20, tzinfo=KST))
+    opens, closes = pc.session_hours(FRIDAY)
+    summary = pc.summarize_watcher_log(pc.parse_kubelet_lines(lines + current, FRIDAY), opens, closes)
+    assert summary["session_minutes_with_reads"] == 390
+
+
 # --- ingress, ledger, agents, verdict ---------------------------------------
 
 
